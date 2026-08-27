@@ -2,7 +2,7 @@
 scripts/main.py
 
 Main entrypoint for Congress data ingestion.
-Supports interactive database setup and CLI options for flexible data scoping (--limit, --full, --random, --bills-per-member).
+Supports interactive database setup and CLI options for flexible data scoping (--limit, --full, --random).
 """
 
 import argparse
@@ -21,7 +21,6 @@ from api import (
     fetch_members_for_districts,
 )
 from config import (
-    BILLS_PER_MEMBER as DEFAULT_BILLS_PER_MEMBER,
     DB_PATH,
     MEMBER_LIMIT as DEFAULT_MEMBER_LIMIT,
 )
@@ -78,7 +77,6 @@ def setup_database(db, reset: bool | None = None):
 def run_ingestion(
     db,
     member_limit: int | None = DEFAULT_MEMBER_LIMIT,
-    bills_per_member: int | None = DEFAULT_BILLS_PER_MEMBER,
     random_sample: bool = False,
 ):
     """Fetch data from Congress API and ingest into database tables incrementally."""
@@ -124,8 +122,6 @@ def run_ingestion(
         load_bills(db, cosponsored, bid, "cosponsor")
 
         all_bills = sponsored + cosponsored
-        if bills_per_member is not None:
-            all_bills = all_bills[:bills_per_member]
 
         for bill in all_bills:
             total_bills_processed += 1
@@ -190,12 +186,6 @@ def parse_args():
         help="Randomly sample districts/members up to --limit instead of deterministic order.",
     )
     parser.add_argument(
-        "--bills-per-member",
-        type=int,
-        default=DEFAULT_BILLS_PER_MEMBER,
-        help="Cap bills processed per member (useful for fast testing).",
-    )
-    parser.add_argument(
         "--reset",
         action="store_true",
         default=None,
@@ -214,7 +204,6 @@ def main():
     args = parse_args()
 
     member_limit = None if args.full else args.limit
-    bills_per_member = args.bills_per_member
     random_sample = args.random
 
     db = duckdb.connect(str(DB_PATH))
@@ -226,7 +215,6 @@ def main():
     run_ingestion(
         db,
         member_limit=member_limit,
-        bills_per_member=bills_per_member,
         random_sample=random_sample,
     )
 

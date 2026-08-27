@@ -38,7 +38,6 @@ CONGRESS = 119
 # Execution scope limits (can be overridden via environment variables or CLI arguments)
 # None = full ingestion without caps
 MEMBER_LIMIT = int(os.environ["MEMBER_LIMIT"]) if os.environ.get("MEMBER_LIMIT") else 5
-BILLS_PER_MEMBER = int(os.environ["BILLS_PER_MEMBER"]) if os.environ.get("BILLS_PER_MEMBER") else None
 
 # Maps 2-digit state FIPS codes to abbreviations
 STATE_FIPS_TO_ABBR = {

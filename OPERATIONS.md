@@ -5,9 +5,13 @@ How would this pipeline run on a recurring basis? What's incremental vs. full-re
 
 What signals would tell you the pipeline is healthy? Where would alerts go, and at what threshold?
 *     If runtime is at or below the expected runtime at specific threshold such as full or incremental run times.
-*     Runs succeding
+*     Runs succeding, Run starting
+*  Alerts needed for run time, run execution, run success, How many amendments bills processed.  
+* Thresholds should be determined based on the amount processed or a default. Having a static or dynamic threshold. I'm leaning towards dynamic
 
 Edge cases. Walk through behavior for at least three of: at-large districts (AL), non-voting delegates (Puerto Rico, DC, etc.), mid-Congress vacancies, party switches, withdrawn cosponsorships, redistricting between the 2020 and 2030 cycles.
+Party Switches would  be picked up on runs. Members table has an updated section. This would prompt an update when a run occurs.
+
 
 
 

@@ -15,3 +15,4 @@ Scale. What changes at 10x — 3,000 counties? Adding Senate activity? Adding st
 * Drastically increasing the time to run.
 * Creating separate pipelines would be needed.
 * Limiting what can be done to the data while ingesting. Such as transformations grouping aggregations.
+* Reads taking longer.

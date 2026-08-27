@@ -11,6 +11,11 @@ Please cover:
 
 You can write this as a few short paragraphs or a tight bulleted list — whichever fits how you actually used it.
 
+### Few sentences
+- I used AI to validate what i thought would be best. Keep a to do list of what needs to be done. Python is sensitive to formatting. Using AI for code generation and copying and pasting is the best choice to avoid small errors that can be overlooked because of a small space.
+- I did not use AI to move small amounts such as a single function, or make very small details changes.
+- When discussing AI only wanted to use updated_date or checksum. I countered with using both to have the desired outcome.
+
 ### Activity Log
 - Extracted configuration settings and environment variable management from `scripts/main.py` into a dedicated `scripts/config.py` module to begin modularizing the ingestion pipeline.
 - Extracted database loading functions (`load_members`, `load_bills`, `load_amendments`) from `scripts/main.py` into `scripts/ingestion.py` to isolate persistence logic.

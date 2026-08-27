@@ -18,3 +18,6 @@ You can write this as a few short paragraphs or a tight bulleted list — whiche
 - Extracted Congress API interactions, pagination, and fetching logic (`api_get`, `paginate`, `fetch_*`) from `scripts/main.py` into `scripts/api.py`.
 - Separated database setup and ingestion flows in `scripts/main.py` into dedicated functions (`setup_database` and `run_ingestion`) and added interactive terminal prompts to make table recreation optional.
 - Implemented incremental timestamp tracking (`update_date`) and MD5 content hashing (`row_hash`) with `ON CONFLICT` upserts in `scripts/ingestion.py` and `scripts/database.py` to bypass unchanged amendment API calls and ensure idempotent writes.
+- Added terminal prompt input validation with retry looping in `prompt_reset_tables()`, seed table existence validation in `database.py` (`check_tables_exist`, `validate_seed_tables`), and created unit test `tests/test_main_prompt.py`.
+- Prepared mock datasets and in-memory DuckDB helper fixtures in `scripts/mock_data.py` for isolated unit testing.
+- Created `tests/test_ingestion_validation.py` to test schema existence checks, member/bill/amendment ingestion, checksum calculation, idempotency on repeat runs, and in-place updates on content changes without touching production data.

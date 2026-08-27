@@ -2,7 +2,7 @@
 tests/test_ingestion_validation.py
 
 Unit and integration tests for data ingestion, schema validation, checksumming,
-and idempotency using isolated in-memory DuckDB instances.
+idempotency, and deterministic vs. random district sampling.
 """
 
 from pathlib import Path
@@ -11,8 +11,14 @@ import sys
 # Add scripts directory to path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
-from database import check_tables_exist, create_tables, validate_seed_tables
+from database import (
+    check_tables_exist,
+    create_tables,
+    get_target_districts,
+    validate_seed_tables,
+)
 from ingestion import load_amendments, load_bills, load_members
+from main import parse_args
 from mock_data import (
     MOCK_AMENDMENTS,
     MOCK_COSPONSORED_BILLS,
@@ -159,6 +165,56 @@ def test_row_update_on_content_change():
     db.close()
 
 
+def test_deterministic_vs_random_district_sampling():
+    """Verify deterministic vs random ordering options in get_target_districts."""
+    db = create_in_memory_db_with_seeds()
+
+    # Deterministic call
+    districts_det = get_target_districts(db, shuffle=False)
+    assert len(districts_det) == 2
+    # In deterministic mode, GA (1314) comes before TX (4821)
+    assert districts_det[0][0] == "GA"
+    assert districts_det[1][0] == "TX"
+
+    # Random shuffle call returns valid districts in a valid list
+    districts_rand = get_target_districts(db, shuffle=True)
+    assert len(districts_rand) == 2
+    states = {d[0] for d in districts_rand}
+    assert states == {"GA", "TX"}
+
+    db.close()
+
+
+def test_cli_random_flag_parsing():
+    """Verify CLI --random flag is properly parsed."""
+    # Test without --random
+    with sys_argv(["scripts/main.py", "--limit", "10"]):
+        args = parse_args()
+        assert args.random is False
+        assert args.limit == 10
+
+    # Test with --random
+    with sys_argv(["scripts/main.py", "--limit", "15", "--random"]):
+        args = parse_args()
+        assert args.random is True
+        assert args.limit == 15
+
+
+class sys_argv:
+    """Context manager to safely mock sys.argv for CLI testing."""
+    def __init__(self, argv):
+        self.argv = argv
+        self._orig = None
+
+    def __enter__(self):
+        self._orig = sys.argv
+        sys.argv = self.argv
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        sys.argv = self._orig
+
+
 if __name__ == "__main__":
     test_table_existence_validation()
     test_member_ingestion_and_data_validation()
@@ -166,4 +222,6 @@ if __name__ == "__main__":
     test_amendments_ingestion()
     test_idempotent_duplicate_run()
     test_row_update_on_content_change()
+    test_deterministic_vs_random_district_sampling()
+    test_cli_random_flag_parsing()
     print("All ingestion and data validation tests passed successfully.")

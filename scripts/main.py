@@ -1,11 +1,14 @@
 """
 scripts/main.py
 
-Traversal strategy: district-first with incremental timestamp check and checksum tracking.
+Main entrypoint for Congress data ingestion.
+Supports interactive database setup and CLI options for flexible data scoping (--limit, --full, --random, --bills-per-member).
 """
 
+import argparse
 from pathlib import Path
 import sys
+import time
 
 import duckdb
 
@@ -18,9 +21,9 @@ from api import (
     fetch_members_for_districts,
 )
 from config import (
-    BILLS_PER_MEMBER,
+    BILLS_PER_MEMBER as DEFAULT_BILLS_PER_MEMBER,
     DB_PATH,
-    MEMBER_LIMIT,
+    MEMBER_LIMIT as DEFAULT_MEMBER_LIMIT,
 )
 from database import (
     check_tables_exist,
@@ -51,9 +54,17 @@ def prompt_reset_tables() -> bool:
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 
-def setup_database(db):
-    """Initialize database tables, prompting for full reset."""
-    should_reset = prompt_reset_tables()
+def setup_database(db, reset: bool | None = None):
+    """
+    Initialize database tables.
+    If reset is explicitly provided (True/False via CLI), use it.
+    Otherwise, interactively prompt the user.
+    """
+    if reset is None:
+        should_reset = prompt_reset_tables()
+    else:
+        should_reset = reset
+
     if should_reset:
         print("Recreating raw tables (reset mode)...")
         create_tables(db, replace=True)
@@ -64,8 +75,15 @@ def setup_database(db):
 
 # ── Ingestion ─────────────────────────────────────────────────────────────────
 
-def run_ingestion(db):
+def run_ingestion(
+    db,
+    member_limit: int | None = DEFAULT_MEMBER_LIMIT,
+    bills_per_member: int | None = DEFAULT_BILLS_PER_MEMBER,
+    random_sample: bool = False,
+):
     """Fetch data from Congress API and ingest into database tables incrementally."""
+    start_time = time.time()
+
     # Validate prerequisite tables before running
     if not validate_seed_tables(db):
         raise RuntimeError(
@@ -77,24 +95,27 @@ def run_ingestion(db):
         print("Raw destination tables missing. Creating raw tables...")
         create_tables(db, replace=False)
 
-    print("\nReading target districts from seed tables...")
-    target_districts = get_target_districts(db)
+    print(f"\nReading target districts from seed tables (random={random_sample})...")
+    target_districts = get_target_districts(db, shuffle=random_sample)
 
     # Load existing bill timestamps for incremental change detection
     existing_bill_timestamps = get_existing_bill_timestamps(db)
 
-    print(f"\nFetching members (limit={MEMBER_LIMIT})...")
-    members = fetch_members_for_districts(target_districts, member_limit=MEMBER_LIMIT)
+    limit_desc = "ALL" if member_limit is None else str(member_limit)
+    print(f"\nFetching members (limit={limit_desc}, random={random_sample})...")
+    members = fetch_members_for_districts(target_districts, member_limit=member_limit)
     load_members(db, members)
 
     # Track processed bills in current session to avoid duplicate work
     processed_bills = set()
     skipped_amendments = 0
     fetched_amendments = 0
+    total_bills_processed = 0
 
-    for member in members:
+    for idx, member in enumerate(members, start=1):
         bid = member["bioguideId"]
-        print(f"\nProcessing {member.get('name', bid)}...")
+        member_start = time.time()
+        print(f"\n[{idx}/{len(members)}] Processing {member.get('name', bid)}...")
 
         sponsored, cosponsored = fetch_legislation_for_member(bid)
         print(f"  {len(sponsored)} sponsored, {len(cosponsored)} cosponsored bills")
@@ -103,10 +124,11 @@ def run_ingestion(db):
         load_bills(db, cosponsored, bid, "cosponsor")
 
         all_bills = sponsored + cosponsored
-        if BILLS_PER_MEMBER is not None:
-            all_bills = all_bills[:BILLS_PER_MEMBER]
+        if bills_per_member is not None:
+            all_bills = all_bills[:bills_per_member]
 
         for bill in all_bills:
+            total_bills_processed += 1
             congress = bill.get("congress")
             bill_type = bill.get("type", "").upper()
             bill_number = str(bill.get("number"))
@@ -126,10 +148,18 @@ def run_ingestion(db):
 
             fetched_amendments += 1
             amendments = fetch_amendments_for_bill(congress, bill_type, bill_number)
-            print(f"{congress} - {bill_type}-{bill_number}: {len(amendments)} amendments")
+            print(f"  {congress} - {bill_type}-{bill_number}: {len(amendments)} amendments")
             load_amendments(db, amendments, congress, bill_type, bill_number)
 
-    print(f"\nAmendments summary: {fetched_amendments} fetched, {skipped_amendments} unchanged (skipped)")
+        print(f"  Completed member in {time.time() - member_start:.2f}s")
+
+    elapsed = time.time() - start_time
+    print(f"\n── Ingestion Summary ──")
+    print(f"  Total time elapsed: {elapsed:.2f}s")
+    print(f"  Members processed: {len(members)}")
+    print(f"  Unique bills tracked: {len(processed_bills)}")
+    print(f"  Amendment calls made: {fetched_amendments}")
+    print(f"  Amendment calls skipped (unchanged): {skipped_amendments}")
 
     print("\n── Tables in dev.duckdb ──")
     for (table,) in db.execute("SHOW TABLES").fetchall():
@@ -137,16 +167,68 @@ def run_ingestion(db):
         print(f"  {table}: {count} rows")
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── CLI & Main ────────────────────────────────────────────────────────────────
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Ingest Congress data into DuckDB for downstream dbt transformations."
+    )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Run ingestion for all target district members (no limit).",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_MEMBER_LIMIT,
+        help=f"Cap the number of members to ingest (default: {DEFAULT_MEMBER_LIMIT}). Ignored if --full is set.",
+    )
+    parser.add_argument(
+        "--random",
+        action="store_true",
+        help="Randomly sample districts/members up to --limit instead of deterministic order.",
+    )
+    parser.add_argument(
+        "--bills-per-member",
+        type=int,
+        default=DEFAULT_BILLS_PER_MEMBER,
+        help="Cap bills processed per member (useful for fast testing).",
+    )
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        default=None,
+        help="Force table recreation/reset without prompting.",
+    )
+    parser.add_argument(
+        "--no-reset",
+        action="store_false",
+        dest="reset",
+        help="Skip table reset without prompting (preserve existing data).",
+    )
+    return parser.parse_args()
+
 
 def main():
+    args = parse_args()
+
+    member_limit = None if args.full else args.limit
+    bills_per_member = args.bills_per_member
+    random_sample = args.random
+
     db = duckdb.connect(str(DB_PATH))
 
     # Setup phase (table initialization/reset)
-    setup_database(db)
+    setup_database(db, reset=args.reset)
 
     # Ingestion phase
-    run_ingestion(db)
+    run_ingestion(
+        db,
+        member_limit=member_limit,
+        bills_per_member=bills_per_member,
+        random_sample=random_sample,
+    )
 
     db.close()
     print("\nDone. Run `uv run dbt build` from the dbt/ directory.")

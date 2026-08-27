@@ -120,10 +120,15 @@ def get_existing_bill_timestamps(db) -> dict[tuple[int, str, str], str]:
     return {(row[0], row[1].upper(), str(row[2])): row[3] for row in rows}
 
 
-def get_target_districts(db):
+def get_target_districts(db, shuffle: bool = False):
     """
     Join the two seed tables to find all congressional districts that overlap
     at least one of the 350 target counties.
+
+    Args:
+        db: DuckDB connection
+        shuffle: If True, uses random() ordering to randomly select districts based on limit.
+                 If False (default), orders deterministically by GEOID.
     """
     if not validate_seed_tables(db):
         raise RuntimeError(
@@ -131,7 +136,9 @@ def get_target_districts(db):
             "Please run 'uv run dbt seed' from the dbt/ directory first."
         )
 
-    rows = db.execute("""
+    order_clause = "random()" if shuffle else "census.GEOID_CD119_20, census.GEOID_COUNTY_20"
+
+    rows = db.execute(f"""
         SELECT DISTINCT
             census.GEOID_CD119_20,
             census.GEOID_COUNTY_20,
@@ -144,7 +151,7 @@ def get_target_districts(db):
                || LPAD(CAST(tc.county_fips AS VARCHAR), 3, '0')
         WHERE census.GEOID_CD119_20 NOT LIKE '%ZZ'  -- exclude non-voting delegate districts
         ORDER BY
-            random()
+            {order_clause}
     """).fetchall()
 
     districts = []

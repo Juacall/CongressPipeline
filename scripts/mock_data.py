@@ -53,6 +53,10 @@ MOCK_SPONSORED_BILLS = [
         "number": "101",
         "title": "Protect American Energy Act",
         "updateDate": "2025-02-01T10:00:00Z",
+        "latestAction": {
+            "actionDate": "2025-02-01",
+            "text": "Referred to the House Committee on Energy and Commerce.",
+        },
     }
 ]
 
@@ -63,6 +67,10 @@ MOCK_COSPONSORED_BILLS = [
         "number": "102",
         "title": "Border Security Acceleration Act",
         "updateDate": "2025-02-02T11:00:00Z",
+        "latestAction": {
+            "actionDate": "2025-02-02",
+            "text": "Became Public Law No: 119-1.",
+        },
     }
 ]
 

@@ -74,15 +74,17 @@ def create_tables(db, replace: bool = False):
     """)
     db.execute(f"""
         {create_stmt} main.raw_bills (
-            congress        INTEGER,
-            bill_type       VARCHAR,
-            bill_number     VARCHAR,
-            title           VARCHAR,
-            member_id       VARCHAR,
-            relationship    VARCHAR,
-            update_date     VARCHAR,
-            row_hash        VARCHAR,
-            ingested_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            congress            INTEGER,
+            bill_type           VARCHAR,
+            bill_number         VARCHAR,
+            title               VARCHAR,
+            latest_action_date  VARCHAR,
+            latest_action_text  VARCHAR,
+            member_id           VARCHAR,
+            relationship        VARCHAR,
+            update_date         VARCHAR,
+            row_hash            VARCHAR,
+            ingested_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (congress, bill_type, bill_number, member_id, relationship)
         )
     """)

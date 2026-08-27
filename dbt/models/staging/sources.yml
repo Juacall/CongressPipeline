@@ -53,6 +53,14 @@ sources:
             description: Bill number within its type.
           - name: title
             description: Official bill title.
+          - name: latest_action_date
+            description: >
+              Date of the bill's most-recent action (from latestAction.actionDate).
+              Current-status snapshot — overwritten on each ingestion run.
+          - name: latest_action_text
+            description: >
+              Text of the bill's most-recent action (from latestAction.text).
+              Current-status snapshot — overwritten on each ingestion run.
           - name: member_id
             description: bioguide_id of the member connected to this bill.
           - name: relationship

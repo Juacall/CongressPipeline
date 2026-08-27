@@ -71,19 +71,33 @@ def load_bills(db, bills, member_id, relationship):
         title = b.get("title")
         update_date = b.get("updateDate") or b.get("updateDateIncludingText")
 
-        row_hash = _compute_hash(congress, bill_type, bill_number, title, member_id, relationship)
-        rows.append((
+        # Current bill status: the Congress API exposes the most-recent action
+        # inline on the sponsored/cosponsored list response (no extra call). We
+        # track current status only, so this is overwritten on each run.
+        latest_action = b.get("latestAction") or {}
+        latest_action_date = latest_action.get("actionDate")
+        latest_action_text = latest_action.get("text")
+
+        row_hash = _compute_hash(
             congress, bill_type, bill_number, title, member_id, relationship,
+            latest_action_date, latest_action_text
+        )
+        rows.append((
+            congress, bill_type, bill_number, title,
+            latest_action_date, latest_action_text, member_id, relationship,
             update_date, row_hash, now_iso
         ))
 
     db.executemany("""
         INSERT INTO main.raw_bills (
-            congress, bill_type, bill_number, title, member_id, relationship,
+            congress, bill_type, bill_number, title,
+            latest_action_date, latest_action_text, member_id, relationship,
             update_date, row_hash, ingested_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (congress, bill_type, bill_number, member_id, relationship) DO UPDATE SET
             title = EXCLUDED.title,
+            latest_action_date = EXCLUDED.latest_action_date,
+            latest_action_text = EXCLUDED.latest_action_text,
             update_date = EXCLUDED.update_date,
             row_hash = EXCLUDED.row_hash,
             ingested_at = EXCLUDED.ingested_at

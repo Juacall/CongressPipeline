@@ -10,6 +10,9 @@
 -- for filtering, display, and aggregation rather than bill_id/amendment_id.
 -- bill_title is the parent bill title for both bills and amendments.
 -- amendment_title is null for bills.
+-- bill_status / bill_latest_action_* reflect the CURRENT status of the parent
+-- bill (point-in-time snapshot, no history). Amendments inherit their parent
+-- bill's status. Use bill_status for aggregation, bill_latest_action_text for detail.
 -- amendment_sponsor_*_if_target is only populated when the amendment sponsor
 -- is themselves a target-district member.
 --
@@ -41,6 +44,10 @@ select
     coalesce(la.amendment_title, la.bill_title) as activity_title,
     la.bill_id,
     la.bill_title,                              -- parent bill title for both bills and amendments
+-- Current status of the (parent) bill — snapshot, no history
+    la.bill_status,                            -- coarse category for aggregation
+    la.bill_latest_action_date,                -- date of the most-recent action
+    la.bill_latest_action_text,                -- full text of the most-recent action
     la.amendment_id,
     la.amendment_title,                         -- null for bills
 -- Who proposed the amendment (null for bills, null if outside target districts)

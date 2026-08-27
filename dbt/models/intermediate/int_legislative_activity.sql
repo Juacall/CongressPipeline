@@ -37,7 +37,11 @@ with bills as (
         member_relationship                 as relationship,
         congress,
         bill_type,
-        bill_number
+        bill_number,
+        -- current status of the (parent) bill
+        bill_status                         as bill_status,
+        bill_latest_action_date             as bill_latest_action_date,
+        bill_latest_action_text             as bill_latest_action_text
     from {{ ref('stg_bills') }}
 ),
 
@@ -56,7 +60,11 @@ amendments as (
         end                                 as relationship,
         a.congress,
         a.bill_type,
-        a.bill_number
+        a.bill_number,
+        -- amendments inherit their parent bill's current status
+        b.bill_status                       as bill_status,
+        b.bill_latest_action_date           as bill_latest_action_date,
+        b.bill_latest_action_text           as bill_latest_action_text
     from {{ ref('stg_amendments') }} as a
     inner join {{ ref('stg_bills') }} as b
         on  a.congress    = b.congress
@@ -76,7 +84,10 @@ select
     relationship,
     congress,
     bill_type,
-    bill_number
+    bill_number,
+    bill_status,
+    bill_latest_action_date,
+    bill_latest_action_text
 from bills
 
 union all
@@ -92,5 +103,8 @@ select
     relationship,
     congress,
     bill_type,
-    bill_number
+    bill_number,
+    bill_status,
+    bill_latest_action_date,
+    bill_latest_action_text
 from amendments

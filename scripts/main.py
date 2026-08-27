@@ -21,28 +21,62 @@ from config import (
     BILLS_PER_MEMBER,
     DB_PATH,
     MEMBER_LIMIT,
-    STATE_FIPS_TO_ABBR,
 )
-from database import create_tables, get_existing_bill_timestamps, get_target_districts
+from database import (
+    check_tables_exist,
+    create_tables,
+    get_existing_bill_timestamps,
+    get_target_districts,
+    validate_seed_tables,
+)
 from ingestion import load_amendments, load_bills, load_members
+
+
+# ── Prompt Helper ─────────────────────────────────────────────────────────────
+
+def prompt_reset_tables() -> bool:
+    """
+    Prompt the user to recreate/reset raw tables.
+    Only accepts 'y', 'yes', 'n', 'no' (case-insensitive).
+    Re-prompts until valid input is given.
+    """
+    while True:
+        choice = input("Recreate/reset raw tables? (y/n): ").strip().lower()
+        if choice in ("y", "yes"):
+            return True
+        elif choice in ("n", "no"):
+            return False
+        print("Invalid input. Please enter 'y' (yes) or 'n' (no).")
 
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 
 def setup_database(db):
-    """Initialize database tables, optionally prompting for full reset."""
-    choice = input("Recreate/reset raw tables? (y/N): ").strip().lower()
-    if choice in ("y", "yes"):
+    """Initialize database tables, prompting for full reset."""
+    should_reset = prompt_reset_tables()
+    if should_reset:
         print("Recreating raw tables (reset mode)...")
         create_tables(db, replace=True)
     else:
         print("Ensuring raw tables exist (incremental/preserve mode)...")
         create_tables(db, replace=False)
 
+
 # ── Ingestion ─────────────────────────────────────────────────────────────────
 
 def run_ingestion(db):
     """Fetch data from Congress API and ingest into database tables incrementally."""
+    # Validate prerequisite tables before running
+    if not validate_seed_tables(db):
+        raise RuntimeError(
+            "Prerequisite seed tables ('target_counties', 'raw_census__cd11920_county20') are missing. "
+            "Please run 'uv run dbt seed' from the dbt/ directory first."
+        )
+
+    if not check_tables_exist(db, ["raw_members", "raw_bills", "raw_amendments"]):
+        print("Raw destination tables missing. Creating raw tables...")
+        create_tables(db, replace=False)
+
     print("\nReading target districts from seed tables...")
     target_districts = get_target_districts(db)
 

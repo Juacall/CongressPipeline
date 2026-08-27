@@ -1,7 +1,7 @@
 """
 scripts/database.py
 
-Database schema initialization, connection helpers, and metadata tracking for DuckDB.
+Database schema initialization, connection helpers, validations, and metadata tracking for DuckDB.
 """
 
 from pathlib import Path
@@ -12,14 +12,39 @@ import duckdb
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 try:
-    from config import DB_PATH
+    from config import DB_PATH, STATE_FIPS_TO_ABBR
 except ImportError:
-    from scripts.config import DB_PATH
+    from scripts.config import DB_PATH, STATE_FIPS_TO_ABBR
 
 
 def get_db_connection(db_path: Path = DB_PATH):
     """Open and return a connection to the DuckDB database."""
     return duckdb.connect(str(db_path))
+
+
+def check_tables_exist(db, tables: list[str] = None) -> bool:
+    """
+    Validate whether the specified tables exist in the database.
+    Defaults to checking the 3 required raw tables.
+    """
+    if tables is None:
+        tables = ["raw_members", "raw_bills", "raw_amendments"]
+
+    existing = {
+        row[0] for row in db.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'").fetchall()
+    }
+    missing = [t for t in tables if t not in existing]
+    if missing:
+        return False
+    return True
+
+
+def validate_seed_tables(db) -> bool:
+    """
+    Validate that the prerequisite dbt seed tables exist.
+    """
+    required_seeds = ["target_counties", "raw_census__cd11920_county20"]
+    return check_tables_exist(db, required_seeds)
 
 
 def create_tables(db, replace: bool = False):
@@ -93,26 +118,34 @@ def get_existing_bill_timestamps(db) -> dict[tuple[int, str, str], str]:
         GROUP BY congress, bill_type, bill_number
     """).fetchall()
     return {(row[0], row[1].upper(), str(row[2])): row[3] for row in rows}
+
+
 def get_target_districts(db):
     """
     Join the two seed tables to find all congressional districts that overlap
     at least one of the 350 target counties.
     """
+    if not validate_seed_tables(db):
+        raise RuntimeError(
+            "Prerequisite seed tables ('target_counties', 'raw_census__cd11920_county20') are missing. "
+            "Please run 'uv run dbt seed' from the dbt/ directory first."
+        )
+
     rows = db.execute("""
-                      SELECT DISTINCT
-                          census.GEOID_CD119_20,
-                          census.GEOID_COUNTY_20,
-                          LEFT(census.GEOID_CD119_20, 2)                    AS state_fips,
-                          CAST(RIGHT(census.GEOID_CD119_20, 2) AS INTEGER)  AS district_num
-                      FROM raw_census__cd11920_county20 AS census
-                          INNER JOIN target_counties AS tc
-                      ON census.GEOID_COUNTY_20 =
-                          LPAD(CAST(tc.state_fips AS VARCHAR), 2, '0')
-                          || LPAD(CAST(tc.county_fips AS VARCHAR), 3, '0')
-                      WHERE census.GEOID_CD119_20 NOT LIKE '%ZZ'  -- exclude non-voting delegate districts
-                      ORDER BY
-                          random()
-                      """).fetchall()
+        SELECT DISTINCT
+            census.GEOID_CD119_20,
+            census.GEOID_COUNTY_20,
+            LEFT(census.GEOID_CD119_20, 2)                    AS state_fips,
+            CAST(RIGHT(census.GEOID_CD119_20, 2) AS INTEGER)  AS district_num
+        FROM raw_census__cd11920_county20 AS census
+        INNER JOIN target_counties AS tc
+            ON census.GEOID_COUNTY_20 =
+               LPAD(CAST(tc.state_fips AS VARCHAR), 2, '0')
+               || LPAD(CAST(tc.county_fips AS VARCHAR), 3, '0')
+        WHERE census.GEOID_CD119_20 NOT LIKE '%ZZ'  -- exclude non-voting delegate districts
+        ORDER BY
+            random()
+    """).fetchall()
 
     districts = []
     seen_states = set()

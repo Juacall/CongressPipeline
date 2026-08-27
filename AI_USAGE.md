@@ -15,6 +15,7 @@ You can write this as a few short paragraphs or a tight bulleted list — whiche
 - I used AI to validate what i thought would be best. Keep a to do list of what needs to be done. Python is sensitive to formatting. Using AI for code generation and copying and pasting is the best choice to avoid small errors that can be overlooked because of a small space.
 - I did not use AI to move small amounts such as a single function, or make very small details changes.
 - When discussing AI only wanted to use updated_date or checksum. I countered with using both to have the desired outcome.
+- AI wanted to add BILL PER MEMBER. I removed this flow. I thought it would be good to add for subsets but was getting out of scope.
 
 ### Activity Log
 - Extracted configuration settings and environment variable management from `scripts/main.py` into a dedicated `scripts/config.py` module to begin modularizing the ingestion pipeline.
@@ -26,3 +27,4 @@ You can write this as a few short paragraphs or a tight bulleted list — whiche
 - Added terminal prompt input validation with retry looping in `prompt_reset_tables()`, seed table existence validation in `database.py` (`check_tables_exist`, `validate_seed_tables`), and created unit test `tests/test_main_prompt.py`.
 - Prepared mock datasets and in-memory DuckDB helper fixtures in `scripts/mock_data.py` for isolated unit testing.
 - Created `tests/test_ingestion_validation.py` to test schema existence checks, member/bill/amendment ingestion, checksum calculation, idempotency on repeat runs, and in-place updates on content changes without touching production data.
+- Added bill status tracking (Task 3, current-status-only): ingested `latestAction.{actionDate,text}` into new `raw_bills.latest_action_date/latest_action_text` columns (folded into `row_hash`), derived a coarse `bill_status` bucket in `stg_bills`, and carried status through `int_legislative_activity` (amendments inherit parent status) into `mart_legislative_activity`; verified end-to-end against an isolated scratch DuckDB without touching `dev.duckdb`.

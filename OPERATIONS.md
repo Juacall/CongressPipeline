@@ -10,8 +10,8 @@ What signals would tell you the pipeline is healthy? Where would alerts go, and 
 * Thresholds should be determined based on the amount processed or a default. Having a static or dynamic threshold. I'm leaning towards dynamic
 
 Edge cases. Walk through behavior for at least three of: at-large districts (AL), non-voting delegates (Puerto Rico, DC, etc.), mid-Congress vacancies, party switches, withdrawn cosponsorships, redistricting between the 2020 and 2030 cycles.
-Party Switches would  be picked up on runs. Members table has an updated section. This would prompt an update when a run occurs.
-
+* Party Switches would  be picked up on runs. Members table has an updated section. This would prompt an update when a run occurs.
+* 
 
 
 

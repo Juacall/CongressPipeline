@@ -1,37 +1,7 @@
 """
 scripts/main.py
 
-Traversal strategy: district-first.
-
-The census seed table already maps counties to districts, so we can identify
-which districts overlap our 350 target counties with a local SQL query — no API
-calls needed. From there, /member/congress/{congress}/{state}/{district} lets us
-fetch members for a specific district and congress directly. Every API call is
-anchored to a known target county.
-
-The alternative (bill-first) means pulling all 119th Congress House bills then
-working backwards to find target-district members — most of what you fetch is
-irrelevant.
-
-Traversal order:
-  1. SQL join on seed tables to get target districts.
-  2. /member/congress/{congress}/{state}/{district} per district.
-     Deduplicated by bioguideId — a district may overlap multiple target counties
-     but a member should only appear once in raw_members.
-  3. /member/{bioguideId}/sponsored-legislation and cosponsored-legislation.
-     No congress filter on these endpoints, so 119th Congress filtering happens
-     locally in Python.
-  4. /bill/{congress}/{billType}/{billNumber}/amendments per unique bill.
-     404 = no amendments, treated as empty not an error.
-
-Pagination: paginate() follows pagination.next exhaustively at 250 items/page.
-
-Tables loaded:
-  raw_members    — target-district members only. Amendment sponsors outside
-                   target districts are stored in raw_amendments.sponsor_id
-                   but not loaded as members.
-  raw_bills      — one row per member-bill relationship (sponsor or cosponsor).
-  raw_amendments — all amendments to target bills regardless of sponsor.
+Traversal strategy: district-first with incremental timestamp check and checksum tracking.
 """
 
 from pathlib import Path
@@ -53,27 +23,27 @@ from config import (
     MEMBER_LIMIT,
     STATE_FIPS_TO_ABBR,
 )
-from database import create_tables
+from database import create_tables, get_existing_bill_timestamps
 from ingestion import load_amendments, load_bills, load_members
 
 
-# ── Traversal Queries ─────────────────────────────────────────────────────────
+# ── Setup ─────────────────────────────────────────────────────────────────────
+
+def setup_database(db):
+    """Initialize database tables, optionally prompting for full reset."""
+    choice = input("Recreate/reset raw tables? (y/N): ").strip().lower()
+    if choice in ("y", "yes"):
+        print("Recreating raw tables (reset mode)...")
+        create_tables(db, replace=True)
+    else:
+        print("Ensuring raw tables exist (incremental/preserve mode)...")
+        create_tables(db, replace=False)
+
 
 def get_target_districts(db):
     """
     Join the two seed tables to find all congressional districts that overlap
     at least one of the 350 target counties.
-
-    target_counties stores county identifiers split across state_fips (2-digit)
-    and county_fips (3-digit). The census table stores them as a single 5-digit
-    GEOID_COUNTY_20. We reconstruct the 5-digit key with LPAD to join them.
-
-    Districts are the bridge between counties and members — a county maps to a
-    district, and a district maps to exactly one House member. One county can
-    span multiple districts and one district can span multiple counties.
-
-    Returns:
-        districts: list of (state_abbr, district_num, geoid, geoid_county) tuples
     """
     rows = db.execute("""
         SELECT DISTINCT
@@ -101,28 +71,27 @@ def get_target_districts(db):
             seen_states.add(state_abbr)
 
     print(f"Found {len(districts)} target districts across {len(seen_states)} states")
-    for state_abbr, district_num, geoid_cd, geoid_county in districts:
-        print(f"  {state_abbr}-{district_num} | geoid_cd: {geoid_cd} | county: {geoid_county}")
     return districts
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Ingestion ─────────────────────────────────────────────────────────────────
 
-def main():
-    db = duckdb.connect(str(DB_PATH))
-
-    print("Creating raw tables...")
-    create_tables(db)
-
+def run_ingestion(db):
+    """Fetch data from Congress API and ingest into database tables incrementally."""
     print("\nReading target districts from seed tables...")
     target_districts = get_target_districts(db)
+
+    # Load existing bill timestamps for incremental change detection
+    existing_bill_timestamps = get_existing_bill_timestamps(db)
 
     print(f"\nFetching members (limit={MEMBER_LIMIT})...")
     members = fetch_members_for_districts(target_districts, member_limit=MEMBER_LIMIT)
     load_members(db, members)
 
-    # Track processed bills to avoid fetching amendments more than once per bill
+    # Track processed bills in current session to avoid duplicate work
     processed_bills = set()
+    skipped_amendments = 0
+    fetched_amendments = 0
 
     for member in members:
         bid = member["bioguideId"]
@@ -139,19 +108,46 @@ def main():
             all_bills = all_bills[:BILLS_PER_MEMBER]
 
         for bill in all_bills:
-            key = (bill.get("congress"), bill.get("type"), str(bill.get("number")))
+            congress = bill.get("congress")
+            bill_type = bill.get("type", "").upper()
+            bill_number = str(bill.get("number"))
+            key = (congress, bill_type, bill_number)
+
             if key in processed_bills:
                 continue
             processed_bills.add(key)
-            congress, bill_type, bill_number = key
+
+            # Check if bill was updated since previous ingestion
+            current_update = bill.get("updateDate") or bill.get("updateDateIncludingText")
+            previous_update = existing_bill_timestamps.get(key)
+
+            if previous_update and current_update and current_update <= previous_update:
+                skipped_amendments += 1
+                continue
+
+            fetched_amendments += 1
             amendments = fetch_amendments_for_bill(congress, bill_type, bill_number)
             print(f"{congress} - {bill_type}-{bill_number}: {len(amendments)} amendments")
             load_amendments(db, amendments, congress, bill_type, bill_number)
+
+    print(f"\nAmendments summary: {fetched_amendments} fetched, {skipped_amendments} unchanged (skipped)")
 
     print("\n── Tables in dev.duckdb ──")
     for (table,) in db.execute("SHOW TABLES").fetchall():
         count = db.execute(f"SELECT COUNT(*) FROM main.{table}").fetchone()[0]
         print(f"  {table}: {count} rows")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    db = duckdb.connect(str(DB_PATH))
+
+    # Setup phase (table initialization/reset)
+    setup_database(db)
+
+    # Ingestion phase
+    run_ingestion(db)
 
     db.close()
     print("\nDone. Run `uv run dbt build` from the dbt/ directory.")

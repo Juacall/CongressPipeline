@@ -1,7 +1,7 @@
 """
 scripts/database.py
 
-Database schema initialization and connection helpers for DuckDB.
+Database schema initialization, connection helpers, and metadata tracking for DuckDB.
 """
 
 from pathlib import Path
@@ -22,48 +22,47 @@ def get_db_connection(db_path: Path = DB_PATH):
     return duckdb.connect(str(db_path))
 
 
-def create_tables(db):
+def create_tables(db, replace: bool = False):
     """
-    Create raw tables in DuckDB. CREATE OR REPLACE makes this script safely
-    re-runnable — existing data is wiped and replaced on each run.
+    Initialize raw tables in DuckDB with primary keys and checksum/timestamp tracking.
 
-    Three tables feed the dbt models downstream:
+    Three raw tables feed the dbt models downstream:
     - raw_members:    one row per target-district House member only
     - raw_bills:      one row per member-bill relationship (sponsor or cosponsor)
     - raw_amendments: all amendments to target bills, regardless of sponsor
-
-    Amendment sponsors are not loaded into raw_members unless they happen to
-    be target-district members discovered during district traversal —
-    raw_amendments scope is amendments to target bills regardless of sponsor,
-    not all members who have ever sponsored an amendment.
-
-    Note: the Congress API returns the current set of cosponsors for each bill.
-    A member can withdraw a cosponsorship — when they do, the API simply omits
-    them from subsequent responses. We capture cosponsorships as the API
-    currently reports them.
     """
-    db.execute("""
-        CREATE OR REPLACE TABLE main.raw_members (
-            bioguide_id  VARCHAR,
-            name         VARCHAR,
-            state        VARCHAR,
-            district     INTEGER,
-            party        VARCHAR,
-            geoid_cd     VARCHAR   -- 4-digit GEOID, joins back to census seed
+    create_stmt = "CREATE OR REPLACE TABLE" if replace else "CREATE TABLE IF NOT EXISTS"
+
+    db.execute(f"""
+        {create_stmt} main.raw_members (
+            bioguide_id   VARCHAR,
+            name          VARCHAR,
+            state         VARCHAR,
+            district      INTEGER,
+            party         VARCHAR,
+            geoid_cd      VARCHAR,
+            update_date   VARCHAR,
+            row_hash      VARCHAR,
+            ingested_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (bioguide_id)
         )
     """)
-    db.execute("""
-        CREATE OR REPLACE TABLE main.raw_bills (
+    db.execute(f"""
+        {create_stmt} main.raw_bills (
             congress        INTEGER,
             bill_type       VARCHAR,
             bill_number     VARCHAR,
             title           VARCHAR,
-            member_id       VARCHAR,  -- bioguide_id of the connected member
-            relationship    VARCHAR   -- 'sponsor' or 'cosponsor'
+            member_id       VARCHAR,
+            relationship    VARCHAR,
+            update_date     VARCHAR,
+            row_hash        VARCHAR,
+            ingested_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (congress, bill_type, bill_number, member_id, relationship)
         )
     """)
-    db.execute("""
-        CREATE OR REPLACE TABLE main.raw_amendments (
+    db.execute(f"""
+        {create_stmt} main.raw_amendments (
             congress          INTEGER,
             bill_type         VARCHAR,
             bill_number       VARCHAR,
@@ -71,6 +70,26 @@ def create_tables(db):
             amendment_type    VARCHAR,
             description       VARCHAR,
             purpose           VARCHAR,
-            sponsor_id        VARCHAR   -- null or outside target districts is valid
+            sponsor_id        VARCHAR,
+            update_date       VARCHAR,
+            row_hash          VARCHAR,
+            ingested_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (congress, bill_type, bill_number, amendment_number)
         )
     """)
+
+
+def get_existing_bill_timestamps(db) -> dict[tuple[int, str, str], str]:
+    """
+    Query existing bills and return a map of (congress, bill_type, bill_number) -> update_date.
+    Used for incremental change detection before fetching amendments.
+    """
+    # Ensure table exists first
+    create_tables(db, replace=False)
+    rows = db.execute("""
+        SELECT congress, bill_type, bill_number, MAX(update_date) as max_update
+        FROM main.raw_bills
+        WHERE update_date IS NOT NULL
+        GROUP BY congress, bill_type, bill_number
+    """).fetchall()
+    return {(row[0], row[1].upper(), str(row[2])): row[3] for row in rows}

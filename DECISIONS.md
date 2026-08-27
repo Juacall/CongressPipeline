@@ -2,6 +2,10 @@
 
 For each significant choice you made, 2–4 sentences covering: what you chose, what alternative you rejected, and why.
 
+- **Modularization of Ingestion Pipeline**: Separated the monolithic `scripts/main.py` into dedicated modules (`config.py`, `database.py`, `api.py`, `ingestion.py`). This isolates concerns (environment configuration, network/API client, schema management, and database persistence), making the codebase easy to maintain and test without whole-file context.
+- **Incremental Timestamp Tracking & Checksumming**: Implemented `update_date` comparison to skip re-fetching amendments for unchanged bills on subsequent runs, combined with row-level MD5 checksums (`row_hash`) and `ON CONFLICT DO UPDATE` upserts. We rejected blindly dropping and recreating tables or full-refreshing every endpoint because fetching ~800 amendment endpoints is network-bound (~10 mins); timestamp tracking makes repeat runs sub-second while checksums guarantee deterministic idempotency.
+- **Configurable Setup vs. Ingestion**: Made table recreation/reset an explicit option rather than running `CREATE OR REPLACE` unconditionally on every execution. This enables reviewers and teammates to execute ingestion multiple times against an existing database state safely without data loss.
+
 ## What you chose not to fix
 
 _Name 2–3 specific gaps you saw and chose not to fix. For each, what would break if it became real, and why did you defer?_

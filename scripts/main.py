@@ -23,7 +23,7 @@ from config import (
     MEMBER_LIMIT,
     STATE_FIPS_TO_ABBR,
 )
-from database import create_tables, get_existing_bill_timestamps
+from database import create_tables, get_existing_bill_timestamps, get_target_districts
 from ingestion import load_amendments, load_bills, load_members
 
 
@@ -38,41 +38,6 @@ def setup_database(db):
     else:
         print("Ensuring raw tables exist (incremental/preserve mode)...")
         create_tables(db, replace=False)
-
-
-def get_target_districts(db):
-    """
-    Join the two seed tables to find all congressional districts that overlap
-    at least one of the 350 target counties.
-    """
-    rows = db.execute("""
-        SELECT DISTINCT
-            census.GEOID_CD119_20,
-            census.GEOID_COUNTY_20,
-            LEFT(census.GEOID_CD119_20, 2)                    AS state_fips,
-            CAST(RIGHT(census.GEOID_CD119_20, 2) AS INTEGER)  AS district_num
-        FROM raw_census__cd11920_county20 AS census
-        INNER JOIN target_counties AS tc
-            ON census.GEOID_COUNTY_20 =
-               LPAD(CAST(tc.state_fips AS VARCHAR), 2, '0')
-               || LPAD(CAST(tc.county_fips AS VARCHAR), 3, '0')
-        WHERE census.GEOID_CD119_20 NOT LIKE '%ZZ'  -- exclude non-voting delegate districts
-        ORDER BY
-            random()
-    """).fetchall()
-
-    districts = []
-    seen_states = set()
-
-    for geoid_cd, geoid_county, state_fips, district_num in rows:
-        state_abbr = STATE_FIPS_TO_ABBR.get(state_fips)
-        if state_abbr:  # skip territories not in scope (e.g. Puerto Rico, Guam)
-            districts.append((state_abbr, district_num, geoid_cd, geoid_county))
-            seen_states.add(state_abbr)
-
-    print(f"Found {len(districts)} target districts across {len(seen_states)} states")
-    return districts
-
 
 # ── Ingestion ─────────────────────────────────────────────────────────────────
 

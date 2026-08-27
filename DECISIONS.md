@@ -8,8 +8,10 @@ For each significant choice you made, 2–4 sentences covering: what you chose, 
 
 ## What you chose not to fix
 
-_Name 2–3 specific gaps you saw and chose not to fix. For each, what would break if it became real, and why did you defer?_
+_Name 2–3 specific gaps you saw and chose not to fix. For each, what would break if it became real, and why did you defer?
+- ** Put text queries into sepearate file.
 
 ## Other decisions
 
 _Use this space for any choice you want a reviewer to understand — refactor scope, dependency picks, anything you'd flag in a PR description._
+- **Put text queries into sepearate file.

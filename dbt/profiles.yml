@@ -1,0 +1,7 @@
+mlabs_data_engineering_exercise:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: ../dev.duckdb
+      threads: 4

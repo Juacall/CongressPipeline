@@ -66,7 +66,7 @@ def create_tables(db, replace: bool = False):
             district      INTEGER,
             party         VARCHAR,
             geoid_cd      VARCHAR,
-            update_date   VARCHAR,
+            update_date   TIMESTAMP,
             row_hash      VARCHAR,
             ingested_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (bioguide_id)
@@ -82,7 +82,7 @@ def create_tables(db, replace: bool = False):
             latest_action_text  VARCHAR,
             member_id           VARCHAR,
             relationship        VARCHAR,
-            update_date         VARCHAR,
+            update_date         TIMESTAMP,
             row_hash            VARCHAR,
             ingested_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (congress, bill_type, bill_number, member_id, relationship)
@@ -98,12 +98,33 @@ def create_tables(db, replace: bool = False):
             description       VARCHAR,
             purpose           VARCHAR,
             sponsor_id        VARCHAR,
-            update_date       VARCHAR,
+            update_date       TIMESTAMP,
             row_hash          VARCHAR,
             ingested_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (congress, bill_type, bill_number, amendment_number)
+            PRIMARY KEY (congress, bill_type, bill_number, amendment_number, amendment_type)
         )
     """)
+
+    db.execute(f"""
+            -- Track execution lifecycle
+         {create_stmt} main.ingestion_runs (
+            run_id VARCHAR PRIMARY KEY,
+            started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            completed_at TIMESTAMP,
+            status VARCHAR -- 'RUNNING', 'COMPLETED', 'FAILED'
+        )
+""")
+
+    db.execute(f"""
+            -- Track completed operational steps to allow seamless resumes
+             {create_stmt} main.ingestion_step_history (
+                run_id VARCHAR,
+                step_type VARCHAR,  -- 'MEMBER_BILLS', 'BILL_AMENDMENTS'
+                entity_key VARCHAR, -- e.g., 'bioguide_id' or '119-HR-1234'
+                completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (run_id, step_type, entity_key)
+            )
+""")
 
 
 def get_existing_bill_timestamps(db) -> dict[tuple[int, str, str], str]:

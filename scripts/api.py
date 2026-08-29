@@ -70,7 +70,7 @@ def paginate(url: str, result_key: str, params: dict | None = None) -> list:
         url_without_params = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
         url_params = {k: v[0] for k, v in parse_qs(parsed_url.query).items()}
 
-        merged_params = {first_page_params,url_params}
+        merged_params = {**first_page_params, **url_params}
         data = api_get(url_without_params, params=merged_params)
 
         results.extend(data.get(result_key, []))

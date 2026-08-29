@@ -138,7 +138,7 @@ def load_amendments(db, amendments, congress, bill_type, bill_number):
             congress, bill_type, bill_number, amendment_number, amendment_type,
             description, purpose, sponsor_id, update_date, row_hash, ingested_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT (congress, bill_type, bill_number, amendment_number) DO UPDATE SET
+        ON CONFLICT (congress, bill_type, bill_number, amendment_number, amendment_type) DO UPDATE SET
             amendment_type = EXCLUDED.amendment_type,
             description = EXCLUDED.description,
             purpose = EXCLUDED.purpose,
@@ -148,3 +148,5 @@ def load_amendments(db, amendments, congress, bill_type, bill_number):
             ingested_at = EXCLUDED.ingested_at
         WHERE main.raw_amendments.row_hash != EXCLUDED.row_hash
     """, rows)
+
+

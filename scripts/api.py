@@ -6,6 +6,7 @@ and data fetching routines.
 """
 
 from pathlib import Path
+from urllib.parse import urlparse, parse_qs
 import sys
 import time
 
@@ -31,6 +32,15 @@ def api_get(url: str, params: dict | None = None, retries: int = 5) -> dict:
     for attempt in range(retries):
         time.sleep(0.1)  # throttle every request
         response = requests.get(url, params=query)
+
+        # 1. Handle Rate Limiting (429)
+        if response.status_code == 429:
+            # Respect the API's Retry-After header if provided, else default to a longer sleep (e.g., 60s)
+            retry_after = int(response.headers.get("Retry-After", 60))
+            print(f"Rate limited (429). Waiting {retry_after}s before retrying...")
+            time.sleep(retry_after)
+            continue
+        #  Handle Server Errors
         if response.status_code >= 500:
             wait = 2 ** (attempt + 1)
             print(f"  {response.status_code} on attempt {attempt + 1}, retrying in {wait}s...")
@@ -55,7 +65,14 @@ def paginate(url: str, result_key: str, params: dict | None = None) -> list:
     next_url = url
 
     while next_url:
-        data = api_get(next_url, first_page_params if next_url == url else None)
+        # Parse any query params embedded in next_url by the API
+        parsed_url = urlparse(next_url)
+        url_without_params = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+        url_params = {k: v[0] for k, v in parse_qs(parsed_url.query).items()}
+
+        merged_params = {first_page_params,url_params}
+        data = api_get(url_without_params, params=merged_params)
+
         results.extend(data.get(result_key, []))
         next_url = data.get("pagination", {}).get("next")
 

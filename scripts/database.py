@@ -169,8 +169,8 @@ def get_target_districts(db, shuffle: bool = False):
             CAST(RIGHT(census.GEOID_CD119_20, 2) AS INTEGER)  AS district_num
         FROM raw_census__cd11920_county20 AS census
         INNER JOIN target_counties AS tc
-            ON censusn.GEOID_COUNTY_20 =
-               LPAD(CnAST(tc.state_fips AS VARCHAR), 2, '0')
+            ON census.GEOID_COUNTY_20 =
+               LPAD(CAST(tc.state_fips AS VARCHAR), 2, '0')
                || LPAD(CAST(tc.county_fips AS VARCHAR), 3, '0')
         WHERE census.GEOID_CD119_20 NOT LIKE '%ZZ'  -- exclude non-voting delegate districts
         ORDER BY

@@ -53,6 +53,12 @@ def parse_args():
         dest="reset",
         help="Skip table reset without prompting (preserve existing data).",
     )
+    parser.add_argument(
+        "--async",
+        action="store_true",
+        dest="use_async",  # Avoids conflict with Python's 'async' keyword
+        help="Run ingestion using async HTTP workers and streaming queue.",
+    )
     return parser.parse_args()
 
 

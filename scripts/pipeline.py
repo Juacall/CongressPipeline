@@ -3,15 +3,15 @@ from pathlib import Path
 from helpers import parse_api_date
 import sys
 import time
-# import asyncio
-# import httpx
+import asyncio
+import httpx
 from datetime import datetime
 import duckdb
 
 # Bounded queue and concurrency limits to prevent memory bloat and rate-limiting
-# QUEUE_MAX_SIZE = 500
-# NUM_AMENDMENT_WORKERS = 5
-# SEMAPHORE = asyncio.Semaphore(NUM_AMENDMENT_WORKERS)
+QUEUE_MAX_SIZE = 500
+NUM_AMENDMENT_WORKERS = 5
+SEMAPHORE = asyncio.Semaphore(NUM_AMENDMENT_WORKERS)
 
 
 
@@ -24,6 +24,8 @@ from api import (
     fetch_members_for_districts,
 )
 from config import (
+    BASE_URL,
+    API_KEY,
     DB_PATH,
     MEMBER_LIMIT as DEFAULT_MEMBER_LIMIT,
 )
@@ -81,6 +83,7 @@ def run_ingestion(
         db,
         member_limit: int | None = DEFAULT_MEMBER_LIMIT,
         random_sample: bool = False,
+        use_async: bool = False
 ):
     """Fetch data from Congress API and ingest into database tables incrementally."""
     start_time = time.time()
@@ -107,180 +110,251 @@ def run_ingestion(
     members = fetch_members_for_districts(target_districts, member_limit=member_limit)
     load_members(db, members)
 
-    # Track processed bills in current session to avoid duplicate work
-    skipped_amendments = 0
-    fetched_amendments = 0
-    total_bills_processed = 0
-    # 1. Stage 1: Collect & deduplicate unique bills in memory
-    unique_bills = {}
+    # Execution Branch: Sync vs Async Engine
+    mode = "Async Streaming" if use_async else "Synchronous"
+    print(f"\n Starting Ingestion Pipeline [{mode} Mode]...")
 
-    for idx, member in enumerate(members, start=1):
-        bid = member["bioguideId"]
-        member_start = time.time()
-        print(f"\n[{idx}/{len(members)}] Processing {member.get('name', bid)}...")
+    if use_async:
+        unique_bills_cnt, fetched_amdts, skipped_amdts = run_async_pipeline_wrapper(
+            db, members, existing_bill_timestamps
+        )
+    else:
+        unique_bills_cnt, fetched_amdts, skipped_amdts = run_sync_pipeline(
+            db, members, existing_bill_timestamps
+        )
 
-        sponsored, cosponsored = fetch_legislation_for_member(bid)
-        print(f"  {len(sponsored)} sponsored, {len(cosponsored)} cosponsored bills")
-
-        load_bills(db, sponsored, bid, "sponsor")
-        load_bills(db, cosponsored, bid, "cosponsor")
-
-        for bill in sponsored + cosponsored:
-            key = (
-                bill.get("congress"),
-                bill.get("type", "").upper(),
-                str(bill.get("number")),
-            )
-            if key not in unique_bills:
-                unique_bills[key] = bill
-        print(f"  Completed member in {time.time() - member_start:.2f}s")
-
-    for (congress, bill_type, bill_number), bill in unique_bills.items():
-        total_bills_processed += 1
-
-        # Check if bill was updated since previous ingestion
-        current_update = parse_api_date(bill.get("updateDate") or bill.get("updateDateIncludingText"))
-        previous_update = existing_bill_timestamps.get((congress,bill_type,bill_number))
-
-
-        if previous_update and current_update and current_update <= previous_update:
-            skipped_amendments += 1
-            continue
-
-        fetched_amendments += 1
-        amendments = fetch_amendments_for_bill(congress, bill_type, bill_number)
-        print(f"  {congress} - {bill_type}-{bill_number}: {len(amendments)} amendments")
-        load_amendments(db, amendments, congress, bill_type, bill_number)
 
     elapsed = time.time() - start_time
     print(f"\n── Ingestion Summary ──")
     print(f"  Total time elapsed: {elapsed:.2f}s")
     print(f"  Members processed: {len(members)}")
-    print(f"  Unique bills tracked: {len(unique_bills)}")
-    print(f"  Total bills processed: {total_bills_processed}")
-    print(f"  Amendment calls made: {fetched_amendments}")
-    print(f"  Amendment calls skipped (unchanged): {skipped_amendments}")
+    print(f"  Unique bills tracked: {unique_bills_cnt}")
+    print(f"  Amendment calls made: {fetched_amdts}")
+    print(f"  Amendment calls skipped (unchanged): {skipped_amdts}")
 
     print("\n── Tables in dev.duckdb ──")
     for (table,) in db.execute("SHOW TABLES").fetchall():
         count = db.execute(f"SELECT COUNT(*) FROM main.{table}").fetchone()[0]
         print(f"  {table}: {count} rows")
 
-#---------------- Streaming Pipeline Flow ----------------------
 
-# async def amendment_worker(
-#         worker_id: int,
-#         queue: asyncio.Queue,
-#         client: httpx.AsyncClient,
-#         db,
-#         existing_timestamps: dict,
-#         stats: dict,
-# ):
-#     """
-#     Consumer Worker: Continuously pulls unique bills from the queue
-#     and fetches their amendments.
-#     """
-#     while True:
-#         item = await queue.get()
-#         if item is None:  # Sentinel value signaling pipeline completion
-#             queue.task_done()
-#             break
-#
-#         congress, bill_type, bill_number, update_date_raw = item
-#         key = (congress, bill_type, bill_number)
-#
-#         # 1. Fast In-Memory Timestamp Delta Check
-#         current_update = parse_api_date(update_date_raw)
-#         previous_update = existing_timestamps.get(key)
-#
-#         if previous_update and current_update and current_update <= previous_update:
-#             stats["skipped_amendments"] += 1
-#             queue.task_done()
-#             continue
-#
-#         # 2. Fetch Amendments with Bounded Concurrency
-#         async with SEMAPHORE:
-#             url = f"https://api.congress.gov/v3/bill/{congress}/{bill_type}/{bill_number}/amendments"
-#             params = {"api_key": API_KEY, "format": "json", "limit": 250}
-#
-#             try:
-#                 response = await client.get(url, params=params, timeout=10.0)
-#                 if response.status_code == 429:
-#                     retry_after = int(response.headers.get("Retry-After", 10))
-#                     await asyncio.sleep(retry_after)
-#                     # Re-queue the bill to try again
-#                     await queue.put(item)
-#                     queue.task_done()
-#                     continue
-#
-#                 response.raise_for_status()
-#                 amendments = response.json().get("amendments", [])
-#
-#                 # 3. Synchronous write to DuckDB
-#                 if amendments:
-#                     load_amendments(db, amendments, congress, bill_type, bill_number)
-#                     stats["fetched_amendments"] += 1
-#
-#             except Exception as e:
-#                 print(f"[Worker {worker_id}] Error fetching {congress}-{bill_type}-{bill_number}: {e}")
-#
-#         queue.task_done()
-#
-# async def run_streaming_pipeline(db, members, existing_timestamps):
-#     """
-#     Orchestrates streaming bill ingestion and concurrent amendment workers.
-#     """
-#     queue = asyncio.Queue(maxsize=QUEUE_MAX_SIZE)
-#     unique_bills_seen = set()
-#     stats = {"fetched_amendments": 0, "skipped_amendments": 0}
-#
-#     async with httpx.AsyncClient() as client:
-#         # 1. Spawn Worker Pool (Consumers)
-#         workers = [
-#             asyncio.create_task(
-#                 amendment_worker(i, queue, client, db, existing_timestamps, stats)
-#             )
-#             for i in range(NUM_AMENDMENT_WORKERS)
-#         ]
-#
-#         # 2. Producer Phase: Fetch legislation for each member
-#         for idx, member in enumerate(members, start=1):
-#             bid = member["bioguideId"]
-#             print(f"[{idx}/{len(members)}] Fetching legislation for {member.get('name', bid)}...")
-#
-#             # Fetch sponsored / cosponsored (can also be made async)
-#             sponsored, cosponsored = await fetch_legislation_for_member_async(client, bid)
-#
-#             # Write member-bill relationships immediately
-#             load_bills(db, sponsored, bid, "sponsor")
-#             load_bills(db, cosponsored, bid, "cosponsor")
-#
-#             # Enqueue unique bills for the amendment workers in real time
-#             for bill in sponsored + cosponsored:
-#                 congress = bill.get("congress")
-#                 bill_type = bill.get("type", "").upper()
-#                 bill_number = str(bill.get("number"))
-#                 key = (congress, bill_type, bill_number)
-#
-#                 if key not in unique_bills_seen:
-#                     unique_bills_seen.add(key)
-#                     update_date_raw = bill.get("updateDate") or bill.get("updateDateIncludingText")
-#
-#                     # Push bill into queue (blocks if queue reaches maxsize)
-#                     await queue.put((congress, bill_type, bill_number, update_date_raw))
-#
-#         # 3. Shutdown Workers cleanly once all bills are produced
-#         await queue.join()  # Wait for all queued bills to be processed
-#         for _ in range(NUM_AMENDMENT_WORKERS):
-#             await queue.put(None)  # Send sentinel values
-#
-#         await asyncio.gather(*workers)
-#
-#     print(f"\n── Queue Processing Complete ──")
-#     print(f"  Unique Bills Processed: {len(unique_bills_seen)}")
-#     print(f"  Amendment Packages Fetched: {stats['fetched_amendments']}")
-#     print(f"  Unchanged Bills Skipped: {stats['skipped_amendments']}")
+def run_sync_pipeline(db, members, existing_timestamps):
+    """Synchronous pipeline using in-memory unique_bills dict."""
+    unique_bills = {}
+    skipped_amendments = 0
+    fetched_amendments = 0
 
+    # Stage 1: Load Bills & Deduplicate in Memory
+    for idx, member in enumerate(members, start=1):
+        bid = member["bioguideId"]
+        print(f"[{idx}/{len(members)}] Sync fetching bills for {member.get('name', bid)}...")
+        sponsored, cosponsored = fetch_legislation_for_member(bid)
+
+        load_bills(db, sponsored, bid, "sponsor")
+        load_bills(db, cosponsored, bid, "cosponsor")
+
+        for bill in sponsored + cosponsored:
+            key = (bill.get("congress"), bill.get("type", "").upper(), str(bill.get("number")))
+            if key not in unique_bills:
+                unique_bills[key] = bill
+
+    # Stage 2: Fetch Amendments
+    total_bills = len(unique_bills)
+    for idx, ((congress, bill_type, bill_number), bill) in enumerate(unique_bills.items(), start=1):
+        key = (congress, bill_type, bill_number)
+        bill_ref = f"{congress}-{bill_type}-{bill_number}"
+        current_update = parse_api_date(bill.get("updateDate") or bill.get("updateDateIncludingText"))
+        previous_update = existing_timestamps.get(key)
+
+        if previous_update and current_update and current_update <= previous_update:
+            skipped_amendments += 1
+            print(f"[{idx}/{total_bills}] Skipping amendments for {bill_ref} (unchanged since {previous_update})")
+            continue
+
+        fetched_amendments += 1
+        print(f"[{idx}/{total_bills}] Fetching amendments for {bill_ref}...")
+        amendments = fetch_amendments_for_bill(congress, bill_type, bill_number)
+        load_amendments(db, amendments, congress, bill_type, bill_number)
+        print(f"[{idx}/{total_bills}] Loaded {len(amendments)} amendment(s) for {bill_ref}")
+
+    return len(unique_bills), fetched_amendments, skipped_amendments
+
+
+
+
+# ---------------- Streaming Pipeline Flow ----------------------
+
+def run_async_pipeline_wrapper(db, members, existing_timestamps):
+    """Wrapper to trigger asyncio event loop for async streaming engine."""
+    return asyncio.run(run_streaming_pipeline(db, members, existing_timestamps))
+
+async def amendment_worker(
+        worker_id: int,
+        queue: asyncio.Queue,
+        write_queue: asyncio.Queue,
+        existing_timestamps: dict,
+        stats: dict,
+):
+    """
+    Consumer Worker: Continuously pulls unique bills from the queue, fetches
+    their amendments, and hands the DB write off to the single db_writer_worker
+    (which owns the DuckDB connection) via write_queue.
+    """
+    while True:
+        item = await queue.get()
+        if item is None:  # Sentinel value signaling pipeline completion
+            queue.task_done()
+            break
+
+        congress, bill_type, bill_number, update_date_raw = item
+        key = (congress, bill_type, bill_number)
+        bill_ref = f"{congress}-{bill_type}-{bill_number}"
+
+        # 1. Fast In-Memory Timestamp Delta Check
+        current_update = parse_api_date(update_date_raw)
+        previous_update = existing_timestamps.get(key)
+
+        if previous_update and current_update and current_update <= previous_update:
+            stats["skipped_amendments"] += 1
+            print(f"[Worker {worker_id}] Skipping amendments for {bill_ref} (unchanged since {previous_update})")
+            queue.task_done()
+            continue
+
+        # 2. Fetch Amendments with Bounded Concurrency
+        # Reuse the synchronous api.py client (pagination + 429/5xx retry + 404
+        # handling) off the event loop via a thread so the loop stays responsive.
+        async with SEMAPHORE:
+            try:
+                amendments = await asyncio.to_thread(
+                    fetch_amendments_for_bill, congress, bill_type, bill_number
+                )
+
+                # 3. Hand off the write to the single-owner db_writer_worker
+                if amendments:
+                    stats["fetched_amendments"] += 1
+                    await write_queue.put((amendments, congress, bill_type, bill_number))
+                    print(f"[Worker {worker_id}] Fetched {len(amendments)} amendment(s) for {bill_ref} → queued for write")
+                else:
+                    print(f"[Worker {worker_id}] No amendments for {bill_ref}")
+
+            except Exception as e:
+                print(f"[Worker {worker_id}] Error fetching {bill_ref}: {e}")
+            finally:
+                queue.task_done()
+
+async def run_streaming_pipeline(db, members, existing_timestamps):
+    """
+    Orchestrates streaming bill ingestion and concurrent amendment workers.
+    """
+    queue = asyncio.Queue(maxsize=QUEUE_MAX_SIZE)
+    write_queue = asyncio.Queue(maxsize=QUEUE_MAX_SIZE)
+    unique_bills_seen = set()
+    stats = {"fetched_amendments": 0, "skipped_amendments": 0}
+
+    # Single consumer that owns the DuckDB write connection.
+    writer = asyncio.create_task(db_writer_worker(db, write_queue))
+
+    # 1. Spawn Worker Pool (Consumers)
+    workers = [
+        asyncio.create_task(
+            amendment_worker(i, queue, write_queue, existing_timestamps, stats)
+        )
+        for i in range(NUM_AMENDMENT_WORKERS)
+    ]
+
+    # 2. Producer Phase: Fetch legislation for each member
+    for idx, member in enumerate(members, start=1):
+        bid = member["bioguideId"]
+        print(f"[{idx}/{len(members)}] Fetching legislation for {member.get('name', bid)}...")
+
+        # Fetch sponsored / cosponsored (can also be made async)
+        sponsored, cosponsored = fetch_legislation_for_member(bid)
+
+        # Write member-bill relationships immediately
+        load_bills(db, sponsored, bid, "sponsor")
+        load_bills(db, cosponsored, bid, "cosponsor")
+
+        # Enqueue unique bills for the amendment workers in real time
+        for bill in sponsored + cosponsored:
+            congress = bill.get("congress")
+            bill_type = bill.get("type", "").upper()
+            bill_number = str(bill.get("number"))
+            key = (congress, bill_type, bill_number)
+
+            if key not in unique_bills_seen:
+                unique_bills_seen.add(key)
+                update_date_raw = bill.get("updateDate") or bill.get("updateDateIncludingText")
+
+                # Push bill into queue (blocks if queue reaches maxsize)
+                await queue.put((congress, bill_type, bill_number, update_date_raw))
+
+    # 3. Shutdown fetch workers cleanly once all bills are produced
+    await queue.join()  # Wait for all queued bills to be fetched
+    for _ in range(NUM_AMENDMENT_WORKERS):
+        await queue.put(None)  # Send sentinel values
+    await asyncio.gather(*workers)
+
+    # 4. Drain outstanding writes, then stop the writer (order matters: fetch
+    #    workers are done here, so no new items can be enqueued for writing).
+    await write_queue.join()
+    await write_queue.put(None)  # Sentinel to stop the writer
+    await writer
+
+    print(f"\n── Queue Processing Complete ──")
+    print(f"  Unique Bills Processed: {len(unique_bills_seen)}")
+    print(f"  Amendment Packages Fetched: {stats['fetched_amendments']}")
+    print(f"  Unchanged Bills Skipped: {stats['skipped_amendments']}")
+
+    # Match run_sync_pipeline's return shape: (unique_bill_count, fetched, skipped)
+    return len(unique_bills_seen), stats["fetched_amendments"], stats["skipped_amendments"]
+
+async def db_writer_worker(db, write_queue: asyncio.Queue):
+    """
+    Single-consumer loop that owns the DuckDB write connection.
+
+    Amendment workers hand off (amendments, congress, bill_type, bill_number)
+    tuples here so all writes are serialized through one owner. Items are
+    batched and flushed in one transaction to minimize transaction overhead.
+    """
+    batch = []
+
+    while True:
+        item = await write_queue.get()
+        if item is None:  # Sentinel to stop worker
+            _flush_batch_to_duckdb(db, batch)  # flush any remainder before exit
+            batch.clear()
+            write_queue.task_done()
+            break
+
+        batch.append(item)
+
+        # Flush batch when it reaches size threshold or queue is temporarily empty
+        if len(batch) >= 50 or write_queue.empty():
+            _flush_batch_to_duckdb(db, batch)
+            batch.clear()
+
+        write_queue.task_done()
+
+
+def _flush_batch_to_duckdb(db, batch: list[tuple]):
+    """
+    Persist a batch of per-bill amendment payloads in a single transaction.
+
+    Each item is (amendments, congress, bill_type, bill_number). Reuses
+    load_amendments so the upsert/hash logic lives in exactly one place and
+    stays in sync with the raw_amendments schema.
+    """
+    if not batch:
+        return
+
+    db.execute("BEGIN TRANSACTION;")
+    try:
+        for amendments, congress, bill_type, bill_number in batch:
+            load_amendments(db, amendments, congress, bill_type, bill_number)
+        db.execute("COMMIT;")
+    except Exception as e:
+        db.execute("ROLLBACK;")
+        print(f"[DB Writer] Error flushing batch of {len(batch)}: {e}")
 
 def start_pipeline(args):
     member_limit = None if args.full else args.limit
@@ -296,6 +370,7 @@ def start_pipeline(args):
         db,
         member_limit=member_limit,
         random_sample=random_sample,
+        use_async = args.use_async
     )
 
     db.close()

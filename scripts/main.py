@@ -2,14 +2,12 @@
 scripts/main.py
 
 Main entrypoint for Congress data ingestion.
-Supports interactive database setup and CLI options for flexible data scoping (--limit, --full, --random).
+Supports interactive database setup and CLI options for flexible data scoping (--limit, --full, --random, --members-only, --skip-members).
 """
 
 import argparse
 from pathlib import Path
 import sys
-
-from pipeline import start_pipeline
 
 # Add script folder to path if executed standalone
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -18,6 +16,7 @@ from config import (
     DB_PATH,
     MEMBER_LIMIT as DEFAULT_MEMBER_LIMIT,
 )
+from pipeline import prompt_reset_tables, start_pipeline
 
 # ── CLI & Main ────────────────────────────────────────────────────────────────
 
@@ -59,6 +58,19 @@ def parse_args():
         dest="use_async",  # Avoids conflict with Python's 'async' keyword
         help="Run ingestion using async HTTP workers and streaming queue.",
     )
+
+    parser.add_argument(
+        "--members-only",
+        action="store_true",
+        help="Only fetch and update raw_members metadata; skip bills and amendments.",
+    )
+    parser.add_argument(
+        "--skip-members",
+        action="store_true",
+        help="Skip fetching member metadata and read existing members directly from DuckDB to fetch bills.",
+    )
+
+
     return parser.parse_args()
 
 

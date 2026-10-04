@@ -63,6 +63,7 @@ def create_tables(db, replace: bool = False):
             bioguide_id   VARCHAR,
             name          VARCHAR,
             state         VARCHAR,
+            chamber       VARCHAR,
             district      INTEGER,
             party         VARCHAR,
             geoid_cd      VARCHAR,
@@ -141,6 +142,30 @@ def get_existing_bill_timestamps(db) -> dict[tuple[int, str, str], str]:
         GROUP BY congress, bill_type, bill_number
     """).fetchall()
     return {(row[0], row[1].upper(), str(row[2])): row[3] for row in rows}
+
+
+def get_existing_members(db, member_limit: int | None = None, shuffle: bool = False) -> list[dict]:
+    """
+    Query existing members from raw_members table.
+    Returns a list of dicts with 'bioguideId', 'name', etc.
+    """
+    create_tables(db, replace=False)
+    order_clause = "random()" if shuffle else "bioguide_id"
+    query = f"SELECT bioguide_id, name, state, district, party, geoid_cd FROM main.raw_members ORDER BY {order_clause}"
+    if member_limit is not None:
+        query += f" LIMIT {int(member_limit)}"
+    rows = db.execute(query).fetchall()
+    return [
+        {
+            "bioguideId": row[0],
+            "name": row[1],
+            "state": row[2],
+            "district": row[3],
+            "partyName": row[4],
+            "_geoid_cd": row[5],
+        }
+        for row in rows
+    ]
 
 
 def get_target_districts(db, shuffle: bool = False):

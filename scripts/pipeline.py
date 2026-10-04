@@ -33,13 +33,14 @@ from database import (
     check_tables_exist,
     create_tables,
     get_existing_bill_timestamps,
+    get_existing_members,
     get_target_districts,
     validate_seed_tables,
 )
 from ingestion import load_amendments, load_bills, load_members
 
 
-# ── Prompt Helper ─────────────────────────────────────────────────────────────
+# -- Prompt Helper -------------------------------------------------------------
 
 def prompt_reset_tables() -> bool:
     """
@@ -56,7 +57,7 @@ def prompt_reset_tables() -> bool:
         print("Invalid input. Please enter 'y' (yes) or 'n' (no).")
 
 
-# ── Setup ─────────────────────────────────────────────────────────────────────
+# -- Setup ---------------------------------------------------------------------
 
 def setup_database(db, reset: bool | None = None):
     """
@@ -77,13 +78,15 @@ def setup_database(db, reset: bool | None = None):
         create_tables(db, replace=False)
 
 
-# ── Ingestion ─────────────────────────────────────────────────────────────────
+# -- Ingestion -----------------------------------------------------------------
 
 def run_ingestion(
         db,
         member_limit: int | None = DEFAULT_MEMBER_LIMIT,
         random_sample: bool = False,
-        use_async: bool = False
+        use_async: bool = False,
+        members_only: bool = False,
+        skip_members: bool = False,
 ):
     """Fetch data from Congress API and ingest into database tables incrementally."""
     start_time = time.time()
@@ -99,40 +102,51 @@ def run_ingestion(
         print("Raw destination tables missing. Creating raw tables...")
         create_tables(db, replace=False)
 
-    print(f"\nReading target districts from seed tables (random={random_sample})...")
-    target_districts = get_target_districts(db, shuffle=random_sample)
-
-    # Load existing bill timestamps for incremental change detection
-    existing_bill_timestamps = get_existing_bill_timestamps(db)
-
     limit_desc = "ALL" if member_limit is None else str(member_limit)
-    print(f"\nFetching members (limit={limit_desc}, random={random_sample})...")
-    members = fetch_members_for_districts(target_districts, member_limit=member_limit)
-    load_members(db, members)
 
-    # Execution Branch: Sync vs Async Engine
-    mode = "Async Streaming" if use_async else "Synchronous"
-    print(f"\n Starting Ingestion Pipeline [{mode} Mode]...")
-
-    if use_async:
-        unique_bills_cnt, fetched_amdts, skipped_amdts = run_async_pipeline_wrapper(
-            db, members, existing_bill_timestamps
-        )
+    if skip_members:
+        print(f"\nSkipping member API fetch. Loading existing members from raw_members table (limit={limit_desc}, random={random_sample})...")
+        members = get_existing_members(db, member_limit=member_limit, shuffle=random_sample)
+        print(f"Loaded {len(members)} member(s) from database.")
     else:
-        unique_bills_cnt, fetched_amdts, skipped_amdts = run_sync_pipeline(
-            db, members, existing_bill_timestamps
-        )
+        print(f"\nReading target districts from seed tables (random={random_sample})...")
+        target_districts = get_target_districts(db, shuffle=random_sample)
 
+        print(f"\nFetching members from Congress API (limit={limit_desc}, random={random_sample})...")
+        members = fetch_members_for_districts(target_districts, member_limit=member_limit)
+        load_members(db, members)
+
+    if members_only:
+        print("\n'--members-only' flag specified. Skipping bills and amendments ingestion.")
+        unique_bills_cnt = 0
+        fetched_amdts = 0
+        skipped_amdts = 0
+    else:
+        # Load existing bill timestamps for incremental change detection
+        existing_bill_timestamps = get_existing_bill_timestamps(db)
+
+        # Execution Branch: Sync vs Async Engine
+        mode = "Async Streaming" if use_async else "Synchronous"
+        print(f"\n Starting Ingestion Pipeline [{mode} Mode]...")
+
+        if use_async:
+            unique_bills_cnt, fetched_amdts, skipped_amdts = run_async_pipeline_wrapper(
+                db, members, existing_bill_timestamps
+            )
+        else:
+            unique_bills_cnt, fetched_amdts, skipped_amdts = run_sync_pipeline(
+                db, members, existing_bill_timestamps
+            )
 
     elapsed = time.time() - start_time
-    print(f"\n── Ingestion Summary ──")
+    print(f"\n-- Ingestion Summary --")
     print(f"  Total time elapsed: {elapsed:.2f}s")
     print(f"  Members processed: {len(members)}")
     print(f"  Unique bills tracked: {unique_bills_cnt}")
     print(f"  Amendment calls made: {fetched_amdts}")
     print(f"  Amendment calls skipped (unchanged): {skipped_amdts}")
 
-    print("\n── Tables in dev.duckdb ──")
+    print("\n-- Tables in dev.duckdb --")
     for (table,) in db.execute("SHOW TABLES").fetchall():
         count = db.execute(f"SELECT COUNT(*) FROM main.{table}").fetchone()[0]
         print(f"  {table}: {count} rows")
@@ -233,7 +247,7 @@ async def amendment_worker(
                 if amendments:
                     stats["fetched_amendments"] += 1
                     await write_queue.put((amendments, congress, bill_type, bill_number))
-                    print(f"[Worker {worker_id}] Fetched {len(amendments)} amendment(s) for {bill_ref} → queued for write")
+                    print(f"[Worker {worker_id}] Fetched {len(amendments)} amendment(s) for {bill_ref} -> queued for write")
                 else:
                     print(f"[Worker {worker_id}] No amendments for {bill_ref}")
 
@@ -300,7 +314,7 @@ async def run_streaming_pipeline(db, members, existing_timestamps):
     await write_queue.put(None)  # Sentinel to stop the writer
     await writer
 
-    print(f"\n── Queue Processing Complete ──")
+    print(f"\n-- Queue Processing Complete --")
     print(f"  Unique Bills Processed: {len(unique_bills_seen)}")
     print(f"  Amendment Packages Fetched: {stats['fetched_amendments']}")
     print(f"  Unchanged Bills Skipped: {stats['skipped_amendments']}")
@@ -370,7 +384,9 @@ def start_pipeline(args):
         db,
         member_limit=member_limit,
         random_sample=random_sample,
-        use_async = args.use_async
+        use_async=args.use_async,
+        members_only=args.members_only,
+        skip_members=args.skip_members,
     )
 
     db.close()

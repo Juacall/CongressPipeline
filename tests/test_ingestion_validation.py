@@ -7,6 +7,7 @@ idempotency, and deterministic vs. random district sampling.
 
 from pathlib import Path
 import sys
+from unittest.mock import patch
 
 # Add scripts directory to path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
@@ -14,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 from database import (
     check_tables_exist,
     create_tables,
+    get_existing_members,
     get_target_districts,
     validate_seed_tables,
 )
@@ -26,6 +28,7 @@ from mock_data import (
     MOCK_SPONSORED_BILLS,
     create_in_memory_db_with_seeds,
 )
+from pipeline import run_ingestion
 
 
 def test_table_existence_validation():
@@ -185,19 +188,90 @@ def test_deterministic_vs_random_district_sampling():
     db.close()
 
 
-def test_cli_random_flag_parsing():
-    """Verify CLI --random flag is properly parsed."""
-    # Test without --random
+def test_get_existing_members():
+    """Verify get_existing_members retrieves member records from raw_members table."""
+    db = create_in_memory_db_with_seeds()
+    load_members(db, MOCK_MEMBERS)
+
+    members = get_existing_members(db)
+    assert len(members) == 2
+    assert members[0]["bioguideId"] == "G000596"
+    assert members[0]["name"] == "Greene, Marjorie Taylor"
+    assert members[1]["bioguideId"] == "R000614"
+
+    # Test limit
+    members_limited = get_existing_members(db, member_limit=1)
+    assert len(members_limited) == 1
+    assert members_limited[0]["bioguideId"] == "G000596"
+    db.close()
+
+
+def test_cli_flags_parsing():
+    """Verify CLI --members-only, --skip-members, and --random flags are properly parsed."""
+    # Test without flags
     with sys_argv(["scripts/main.py", "--limit", "10"]):
         args = parse_args()
         assert args.random is False
         assert args.limit == 10
+        assert args.members_only is False
+        assert args.skip_members is False
 
-    # Test with --random
-    with sys_argv(["scripts/main.py", "--limit", "15", "--random"]):
+    # Test with --members-only
+    with sys_argv(["scripts/main.py", "--members-only"]):
         args = parse_args()
-        assert args.random is True
-        assert args.limit == 15
+        assert args.members_only is True
+
+    # Test with --skip-members
+    with sys_argv(["scripts/main.py", "--skip-members"]):
+        args = parse_args()
+        assert args.skip_members is True
+
+
+@patch("pipeline.fetch_members_for_districts", return_value=MOCK_MEMBERS)
+@patch("pipeline.fetch_legislation_for_member", return_value=(MOCK_SPONSORED_BILLS, MOCK_COSPONSORED_BILLS))
+@patch("pipeline.fetch_amendments_for_bill", return_value=MOCK_AMENDMENTS)
+def test_run_ingestion_members_only(mock_amendments, mock_leg, mock_members):
+    """Verify run_ingestion with members_only=True skips bills and amendments."""
+    db = create_in_memory_db_with_seeds()
+
+    run_ingestion(db, member_limit=2, members_only=True)
+
+    member_count = db.execute("SELECT COUNT(*) FROM main.raw_members").fetchone()[0]
+    bill_count = db.execute("SELECT COUNT(*) FROM main.raw_bills").fetchone()[0]
+    amendment_count = db.execute("SELECT COUNT(*) FROM main.raw_amendments").fetchone()[0]
+
+    assert member_count == 2
+    assert bill_count == 0
+    assert amendment_count == 0
+
+    assert mock_members.called
+    assert not mock_leg.called
+    assert not mock_amendments.called
+    db.close()
+
+
+@patch("pipeline.fetch_members_for_districts")
+@patch("pipeline.fetch_legislation_for_member", return_value=(MOCK_SPONSORED_BILLS, MOCK_COSPONSORED_BILLS))
+@patch("pipeline.fetch_amendments_for_bill", return_value=MOCK_AMENDMENTS)
+def test_run_ingestion_skip_members(mock_amendments, mock_leg, mock_members):
+    """Verify run_ingestion with skip_members=True pulls members from table and ingests bills/amendments."""
+    db = create_in_memory_db_with_seeds()
+
+    # Pre-populate raw_members
+    load_members(db, MOCK_MEMBERS)
+
+    run_ingestion(db, skip_members=True)
+
+    assert not mock_members.called
+    assert mock_leg.called
+    assert mock_amendments.called
+
+    bill_count = db.execute("SELECT COUNT(*) FROM main.raw_bills").fetchone()[0]
+    amendment_count = db.execute("SELECT COUNT(*) FROM main.raw_amendments").fetchone()[0]
+
+    assert bill_count > 0
+    assert amendment_count > 0
+    db.close()
 
 
 class sys_argv:
@@ -223,5 +297,8 @@ if __name__ == "__main__":
     test_idempotent_duplicate_run()
     test_row_update_on_content_change()
     test_deterministic_vs_random_district_sampling()
-    test_cli_random_flag_parsing()
+    test_get_existing_members()
+    test_cli_flags_parsing()
+    test_run_ingestion_members_only()
+    test_run_ingestion_skip_members()
     print("All ingestion and data validation tests passed successfully.")

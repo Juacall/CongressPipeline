@@ -29,21 +29,23 @@ def load_members(db, members):
         bid = m.get("bioguideId")
         name = m.get("name")
         state = m.get("state")
+        chamber = m.get("chamber") or ("House" if m.get("district") is not None else "Senate")
         district = m.get("district")
         party = m.get("partyName")
         geoid_cd = m.get("_geoid_cd")
         update_date = m.get("updateDate")
 
-        row_hash = _compute_hash(bid, name, state, district, party, geoid_cd)
-        rows.append((bid, name, state, district, party, geoid_cd, update_date, row_hash, now_iso))
+        row_hash = _compute_hash(bid, name, state, chamber, district, party, geoid_cd)
+        rows.append((bid, name, state, chamber, district, party, geoid_cd, update_date, row_hash, now_iso))
 
     db.executemany("""
         INSERT INTO main.raw_members (
-            bioguide_id, name, state, district, party, geoid_cd, update_date, row_hash, ingested_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            bioguide_id, name, state, chamber, district, party, geoid_cd, update_date, row_hash, ingested_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (bioguide_id) DO UPDATE SET
             name = EXCLUDED.name,
             state = EXCLUDED.state,
+            chamber = EXCLUDED.chamber,
             district = EXCLUDED.district,
             party = EXCLUDED.party,
             geoid_cd = EXCLUDED.geoid_cd,
@@ -148,5 +150,3 @@ def load_amendments(db, amendments, congress, bill_type, bill_number):
             ingested_at = EXCLUDED.ingested_at
         WHERE main.raw_amendments.row_hash != EXCLUDED.row_hash
     """, rows)
-
-

@@ -26,3 +26,4 @@ inner join {{ ref('target_counties') }} as tc
     on census.GEOID_COUNTY_20 =
        lpad(cast(tc.state_fips  as varchar), 2, '0')
     || lpad(cast(tc.county_fips as varchar), 3, '0')
+where lower(m.chamber) = 'house'

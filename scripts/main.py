@@ -2,7 +2,7 @@
 scripts/main.py
 
 Main entrypoint for Congress data ingestion.
-Supports interactive database setup and CLI options for flexible data scoping (--limit, --full, --random, --members-only, --skip-members).
+Supports interactive database setup and CLI options for flexible data scoping (--limit, --full, --random, --members-only, --skip-members, --house, --senate).
 """
 
 import argparse
@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from config import (
     DB_PATH,
+    DEFAULT_CHAMBER,
     MEMBER_LIMIT as DEFAULT_MEMBER_LIMIT,
 )
 from pipeline import prompt_reset_tables, start_pipeline
@@ -70,6 +71,25 @@ def parse_args():
         help="Skip fetching member metadata and read existing members directly from DuckDB to fetch bills.",
     )
 
+    # Chamber selection options
+    parser.add_argument(
+        "--house",
+        "-house",
+        action="store_true",
+        help="Fetch House members only (default).",
+    )
+    parser.add_argument(
+        "--senate",
+        "-senate",
+        action="store_true",
+        help="Fetch Senate members only.",
+    )
+    parser.add_argument(
+        "--chamber",
+        choices=["house", "senate", "both"],
+        default=None,
+        help=f"Specify chamber: 'house', 'senate', or 'both' (default from config: '{DEFAULT_CHAMBER}').",
+    )
 
     return parser.parse_args()
 

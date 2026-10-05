@@ -2,7 +2,7 @@
 tests/test_ingestion_validation.py
 
 Unit and integration tests for data ingestion, schema validation, checksumming,
-idempotency, and deterministic vs. random district sampling.
+idempotency, deterministic vs. random district sampling, and chamber filtering.
 """
 
 from pathlib import Path
@@ -25,6 +25,10 @@ from mock_data import (
     MOCK_AMENDMENTS,
     MOCK_COSPONSORED_BILLS,
     MOCK_MEMBERS,
+    MOCK_SENATE_AMENDMENTS,
+    MOCK_SENATE_COSPONSORED_BILLS,
+    MOCK_SENATE_MEMBERS,
+    MOCK_SENATE_SPONSORED_BILLS,
     MOCK_SPONSORED_BILLS,
     create_in_memory_db_with_seeds,
 )
@@ -49,7 +53,7 @@ def test_member_ingestion_and_data_validation():
     db = create_in_memory_db_with_seeds()
 
     load_members(db, MOCK_MEMBERS)
-    rows = db.execute("SELECT bioguide_id, name, state, district, party, geoid_cd, row_hash FROM main.raw_members ORDER BY bioguide_id").fetchall()
+    rows = db.execute("SELECT bioguide_id, name, state, chamber, district, party, geoid_cd, row_hash FROM main.raw_members ORDER BY bioguide_id").fetchall()
 
     assert len(rows) == 2
 
@@ -58,20 +62,40 @@ def test_member_ingestion_and_data_validation():
     assert mtg[0] == "G000596"
     assert mtg[1] == "Greene, Marjorie Taylor"
     assert mtg[2] == "GA"
-    assert mtg[3] == 14
-    assert mtg[4] == "Republican"
-    assert mtg[5] == "1314"
-    assert mtg[6] is not None  # row_hash computed
+    assert mtg[3] == "House"
+    assert mtg[4] == 14
+    assert mtg[5] == "Republican"
+    assert mtg[6] == "1314"
+    assert mtg[7] is not None  # row_hash computed
 
     # Validate Chip Roy
     roy = rows[1]
     assert roy[0] == "R000614"
     assert roy[1] == "Roy, Chip"
     assert roy[2] == "TX"
-    assert roy[3] == 21
-    assert roy[4] == "Republican"
-    assert roy[5] == "4821"
-    assert roy[6] is not None
+    assert roy[3] == "House"
+    assert roy[4] == 21
+    assert roy[5] == "Republican"
+    assert roy[6] == "4821"
+    assert roy[7] is not None
+    db.close()
+
+
+def test_senate_member_ingestion():
+    """Verify Senate member records are correctly inserted with chamber='Senate'."""
+    db = create_in_memory_db_with_seeds()
+
+    load_members(db, MOCK_SENATE_MEMBERS)
+    rows = db.execute("SELECT bioguide_id, name, state, chamber, district, party FROM main.raw_members ORDER BY bioguide_id").fetchall()
+
+    assert len(rows) == 2
+    cruz = rows[0]
+    assert cruz[0] == "C001098"
+    assert cruz[1] == "Cruz, Ted"
+    assert cruz[2] == "TX"
+    assert cruz[3] == "Senate"
+    assert cruz[4] is None
+
     db.close()
 
 
@@ -154,6 +178,7 @@ def test_row_update_on_content_change():
             "bioguideId": "G000596",
             "name": "Greene, Marjorie Taylor (Updated)",
             "state": "GA",
+            "chamber": "House",
             "district": 14,
             "partyName": "Republican",
             "_geoid_cd": "1314",
@@ -191,23 +216,28 @@ def test_deterministic_vs_random_district_sampling():
 def test_get_existing_members():
     """Verify get_existing_members retrieves member records from raw_members table."""
     db = create_in_memory_db_with_seeds()
-    load_members(db, MOCK_MEMBERS)
+    load_members(db, MOCK_MEMBERS + MOCK_SENATE_MEMBERS)
 
     members = get_existing_members(db)
-    assert len(members) == 2
-    assert members[0]["bioguideId"] == "G000596"
-    assert members[0]["name"] == "Greene, Marjorie Taylor"
-    assert members[1]["bioguideId"] == "R000614"
+    assert len(members) == 4
+
+    # Test chamber filter
+    house_members = get_existing_members(db, chamber="house")
+    assert len(house_members) == 2
+    assert all(m["chamber"] == "House" for m in house_members)
+
+    senate_members = get_existing_members(db, chamber="senate")
+    assert len(senate_members) == 2
+    assert all(m["chamber"] == "Senate" for m in senate_members)
 
     # Test limit
     members_limited = get_existing_members(db, member_limit=1)
     assert len(members_limited) == 1
-    assert members_limited[0]["bioguideId"] == "G000596"
     db.close()
 
 
 def test_cli_flags_parsing():
-    """Verify CLI --members-only, --skip-members, and --random flags are properly parsed."""
+    """Verify CLI --members-only, --skip-members, --house, --senate, and --random flags are properly parsed."""
     # Test without flags
     with sys_argv(["scripts/main.py", "--limit", "10"]):
         args = parse_args()
@@ -215,6 +245,8 @@ def test_cli_flags_parsing():
         assert args.limit == 10
         assert args.members_only is False
         assert args.skip_members is False
+        assert args.house is False
+        assert args.senate is False
 
     # Test with --members-only
     with sys_argv(["scripts/main.py", "--members-only"]):
@@ -226,6 +258,24 @@ def test_cli_flags_parsing():
         args = parse_args()
         assert args.skip_members is True
 
+    # Test with --senate and -senate
+    with sys_argv(["scripts/main.py", "--senate"]):
+        args = parse_args()
+        assert args.senate is True
+
+    with sys_argv(["scripts/main.py", "-senate"]):
+        args = parse_args()
+        assert args.senate is True
+
+    # Test with --house and -house
+    with sys_argv(["scripts/main.py", "--house"]):
+        args = parse_args()
+        assert args.house is True
+
+    with sys_argv(["scripts/main.py", "-house"]):
+        args = parse_args()
+        assert args.house is True
+
 
 @patch("pipeline.fetch_members_for_districts", return_value=MOCK_MEMBERS)
 @patch("pipeline.fetch_legislation_for_member", return_value=(MOCK_SPONSORED_BILLS, MOCK_COSPONSORED_BILLS))
@@ -234,7 +284,7 @@ def test_run_ingestion_members_only(mock_amendments, mock_leg, mock_members):
     """Verify run_ingestion with members_only=True skips bills and amendments."""
     db = create_in_memory_db_with_seeds()
 
-    run_ingestion(db, member_limit=2, members_only=True)
+    run_ingestion(db, member_limit=2, members_only=True, chamber="house")
 
     member_count = db.execute("SELECT COUNT(*) FROM main.raw_members").fetchone()[0]
     bill_count = db.execute("SELECT COUNT(*) FROM main.raw_bills").fetchone()[0]
@@ -260,7 +310,7 @@ def test_run_ingestion_skip_members(mock_amendments, mock_leg, mock_members):
     # Pre-populate raw_members
     load_members(db, MOCK_MEMBERS)
 
-    run_ingestion(db, skip_members=True)
+    run_ingestion(db, skip_members=True, chamber="house")
 
     assert not mock_members.called
     assert mock_leg.called
@@ -271,6 +321,29 @@ def test_run_ingestion_skip_members(mock_amendments, mock_leg, mock_members):
 
     assert bill_count > 0
     assert amendment_count > 0
+    db.close()
+
+
+@patch("pipeline.fetch_senate_members_for_states", return_value=MOCK_SENATE_MEMBERS)
+@patch("pipeline.fetch_legislation_for_member", return_value=(MOCK_SENATE_SPONSORED_BILLS, MOCK_SENATE_COSPONSORED_BILLS))
+@patch("pipeline.fetch_amendments_for_bill", return_value=MOCK_SENATE_AMENDMENTS)
+def test_run_ingestion_senate(mock_amendments, mock_leg, mock_senate_members):
+    """Verify run_ingestion with chamber='senate' fetches senate members and legislation."""
+    db = create_in_memory_db_with_seeds()
+
+    run_ingestion(db, member_limit=2, chamber="senate")
+
+    member_rows = db.execute("SELECT bioguide_id, chamber FROM main.raw_members ORDER BY bioguide_id").fetchall()
+    assert len(member_rows) == 2
+    assert all(r[1] == "Senate" for r in member_rows)
+
+    bill_rows = db.execute("SELECT congress, bill_type, bill_number FROM main.raw_bills ORDER BY bill_number").fetchall()
+    assert len(bill_rows) == 4
+    assert all(r[1] == "S" for r in bill_rows)
+
+    assert mock_senate_members.called
+    assert mock_leg.called
+    assert mock_amendments.called
     db.close()
 
 
@@ -292,6 +365,7 @@ class sys_argv:
 if __name__ == "__main__":
     test_table_existence_validation()
     test_member_ingestion_and_data_validation()
+    test_senate_member_ingestion()
     test_bills_ingestion_and_relationship()
     test_amendments_ingestion()
     test_idempotent_duplicate_run()
@@ -301,4 +375,5 @@ if __name__ == "__main__":
     test_cli_flags_parsing()
     test_run_ingestion_members_only()
     test_run_ingestion_skip_members()
+    test_run_ingestion_senate()
     print("All ingestion and data validation tests passed successfully.")

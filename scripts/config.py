@@ -35,6 +35,9 @@ if not API_KEY or API_KEY == "your_api_key_here":
 BASE_URL = "https://api.congress.gov/v3"
 CONGRESS = 119
 
+# Default chamber configuration: 'house', 'senate', or 'both'
+DEFAULT_CHAMBER = os.environ.get("CHAMBER", "house").lower()
+
 # Execution scope limits (can be overridden via environment variables or CLI arguments)
 # None = full ingestion without caps
 MEMBER_LIMIT = int(os.environ["MEMBER_LIMIT"]) if os.environ.get("MEMBER_LIMIT") else 5
@@ -53,5 +56,8 @@ STATE_FIPS_TO_ABBR = {
     "51": "VA", "53": "WA", "54": "WV", "55": "WI", "56": "WY",
 }
 
-# House bill types only — filter out Senate legislation
+# Legislation bill and amendment types by chamber
 HOUSE_BILL_TYPES = {"HR", "HRES", "HJRES", "HCONRES"}
+SENATE_BILL_TYPES = {"S", "SRES", "SJRES", "SCONRES"}
+SENATE_AMENDMENTS = "SAMDT"
+HOUSE_AMENDMENTS = "HAMDT"

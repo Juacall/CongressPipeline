@@ -16,9 +16,9 @@ import requests
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 try:
-    from config import API_KEY, BASE_URL, CONGRESS, HOUSE_BILL_TYPES, MEMBER_LIMIT
+    from config import API_KEY, BASE_URL, CONGRESS, HOUSE_BILL_TYPES, SENATE_BILL_TYPES, MEMBER_LIMIT
 except ImportError:
-    from scripts.config import API_KEY, BASE_URL, CONGRESS, HOUSE_BILL_TYPES, MEMBER_LIMIT
+    from scripts.config import API_KEY, BASE_URL, CONGRESS, HOUSE_BILL_TYPES, SENATE_BILL_TYPES, MEMBER_LIMIT
 
 
 def api_get(url: str, params: dict | None = None, retries: int = 5) -> dict:
@@ -108,27 +108,102 @@ def fetch_members_for_districts(districts: list, member_limit: int | None = MEMB
             if not bid or bid in seen_ids:
                 continue
             seen_ids.add(bid)
+            m["chamber"] = "House"
             m["_geoid_cd"] = geoid_cd  # carry the geoid forward for the census join
             members.append(m)
-            print(f"  Member: {m.get('name')} ({state_abbr}-{district_num}) [county GEOID: {geoid_county}]")
+            print(f"  House Member: {m.get('name')} ({state_abbr}-{district_num}) [county GEOID: {geoid_county}]")
 
-    print(f"  Total: {len(members)} members fetched")
+    print(f"  Total: {len(members)} House members fetched")
     return members
 
 
-def fetch_legislation_for_member(bioguide_id: str) -> tuple[list, list]:
+def fetch_senate_members_for_states(states: list[str], member_limit: int | None = MEMBER_LIMIT) -> list:
+    """
+    For each target state, fetch Senate members from the Congress API scoped
+    to the target Congress.
+
+    Endpoint: /member/congress/{congress}/{stateCode}
+    """
+    members = []
+    seen_ids = set()
+
+    for state_abbr in states:
+        if member_limit and len(members) >= member_limit:
+            break
+
+        url = f"{BASE_URL}/member/congress/{CONGRESS}/{state_abbr}"
+        try:
+            page = paginate(url, "members")
+        except requests.HTTPError as e:
+            print(f"  Warning: could not fetch Senate members for {state_abbr}: {e}")
+            continue
+
+        for m in page:
+            # Check if this member is a Senator (no district assigned or terms/chamber indicates Senate)
+            terms = m.get("terms", {})
+            term_items = terms.get("item", []) if isinstance(terms, dict) else []
+            is_senate = False
+            if m.get("district") is None or m.get("district") == "":
+                is_senate = True
+            elif any(isinstance(t, dict) and t.get("chamber") == "Senate" for t in term_items):
+                is_senate = True
+            elif m.get("chamber") == "Senate":
+                is_senate = True
+
+            if not is_senate:
+                continue
+
+            bid = m.get("bioguideId")
+            if not bid or bid in seen_ids:
+                continue
+            seen_ids.add(bid)
+            m["chamber"] = "Senate"
+            m["district"] = None
+            members.append(m)
+            print(f"  Senate Member: {m.get('name')} ({state_abbr})")
+            if member_limit and len(members) >= member_limit:
+                break
+
+    print(f"  Total: {len(members)} Senate members fetched")
+    return members
+
+
+def fetch_legislation_for_member(bioguide_id: str, chamber: str = "house") -> tuple[list, list]:
     """
     Fetch all bills sponsored and cosponsored by a member in the target Congress.
 
-    Returns two separate lists so the caller can store the correct relationship
-    ('sponsor' or 'cosponsor') for each bill in raw_bills.
+    Endpoints:
+      - Sponsored:   /member/{bioguide_id}/sponsored-legislation
+      - Cosponsored: /member/{bioguide_id}/cosponsored-legislation
+
+    Filters bill types based on chamber:
+      - Senate: S, SRES, SJRES, SCONRES
+      - House:  HR, HRES, HJRES, HCONRES
+      - Both:   All above types
+
+    Returns two separate lists (sponsored, cosponsored) with bill metadata.
     """
+    chamber_normalized = (chamber or "house").lower()
+    if chamber_normalized == "senate":
+        valid_types = SENATE_BILL_TYPES
+    elif chamber_normalized in ("both", "all"):
+        valid_types = HOUSE_BILL_TYPES | SENATE_BILL_TYPES
+    else:
+        valid_types = HOUSE_BILL_TYPES
+
     def _fetch(endpoint, result_key):
         url = f"{BASE_URL}/member/{bioguide_id}/{endpoint}"
-        return [
-            b for b in paginate(url, result_key)
-            if b.get("congress") == CONGRESS and b.get("type") in HOUSE_BILL_TYPES
-        ]
+        bills = []
+        for b in paginate(url, result_key):
+            b_congress = b.get("congress")
+            if b_congress is not None and int(b_congress) != CONGRESS:
+                continue
+
+            b_type = (b.get("type") or b.get("billType") or "").upper()
+            if b_type in valid_types:
+                b["type"] = b_type
+                bills.append(b)
+        return bills
 
     sponsored = _fetch("sponsored-legislation", "sponsoredLegislation")
     cosponsored = _fetch("cosponsored-legislation", "cosponsoredLegislation")
@@ -138,6 +213,9 @@ def fetch_legislation_for_member(bioguide_id: str) -> tuple[list, list]:
 def fetch_amendments_for_bill(congress: int, bill_type: str, bill_number: str) -> list:
     """
     Fetch all amendments to a bill, regardless of who sponsored them.
+    Endpoints:
+      - House:  f"{BASE_URL}/bill/{congress}/hr/{bill_number}/amendments" (or hres/hjres/hconres)
+      - Senate: f"{BASE_URL}/bill/{congress}/s/{bill_number}/amendments" (or sres/sjres/sconres)
     Treats 404 as an empty list (bill has no amendments).
     """
     url = f"{BASE_URL}/bill/{congress}/{bill_type.lower()}/{bill_number}/amendments"

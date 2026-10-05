@@ -22,11 +22,13 @@ from api import (
     fetch_amendments_for_bill,
     fetch_legislation_for_member,
     fetch_members_for_districts,
+    fetch_senate_members_for_states,
 )
 from config import (
     BASE_URL,
     API_KEY,
     DB_PATH,
+    DEFAULT_CHAMBER,
     MEMBER_LIMIT as DEFAULT_MEMBER_LIMIT,
 )
 from database import (
@@ -87,9 +89,11 @@ def run_ingestion(
         use_async: bool = False,
         members_only: bool = False,
         skip_members: bool = False,
+        chamber: str = DEFAULT_CHAMBER,
 ):
     """Fetch data from Congress API and ingest into database tables incrementally."""
     start_time = time.time()
+    chamber = (chamber or DEFAULT_CHAMBER).lower()
 
     # Validate prerequisite tables before running
     if not validate_seed_tables(db):
@@ -105,15 +109,27 @@ def run_ingestion(
     limit_desc = "ALL" if member_limit is None else str(member_limit)
 
     if skip_members:
-        print(f"\nSkipping member API fetch. Loading existing members from raw_members table (limit={limit_desc}, random={random_sample})...")
-        members = get_existing_members(db, member_limit=member_limit, shuffle=random_sample)
+        print(f"\nSkipping member API fetch. Loading existing members from raw_members table (chamber={chamber}, limit={limit_desc}, random={random_sample})...")
+        members = get_existing_members(db, member_limit=member_limit, shuffle=random_sample, chamber=chamber if chamber != "both" else None)
         print(f"Loaded {len(members)} member(s) from database.")
     else:
         print(f"\nReading target districts from seed tables (random={random_sample})...")
         target_districts = get_target_districts(db, shuffle=random_sample)
 
-        print(f"\nFetching members from Congress API (limit={limit_desc}, random={random_sample})...")
-        members = fetch_members_for_districts(target_districts, member_limit=member_limit)
+        members = []
+        if chamber in ("house", "both"):
+            print(f"\nFetching House members from Congress API (limit={limit_desc}, random={random_sample})...")
+            house_members = fetch_members_for_districts(target_districts, member_limit=member_limit)
+            members.extend(house_members)
+
+        if chamber in ("senate", "both"):
+            target_states = list(dict.fromkeys(d[0] for d in target_districts))
+            senate_limit = member_limit if chamber == "senate" else (member_limit - len(members) if member_limit else None)
+            if senate_limit is None or senate_limit > 0:
+                print(f"\nFetching Senate members from Congress API (limit={limit_desc}, random={random_sample})...")
+                senate_members = fetch_senate_members_for_states(target_states, member_limit=senate_limit)
+                members.extend(senate_members)
+
         load_members(db, members)
 
     if members_only:
@@ -127,20 +143,21 @@ def run_ingestion(
 
         # Execution Branch: Sync vs Async Engine
         mode = "Async Streaming" if use_async else "Synchronous"
-        print(f"\n Starting Ingestion Pipeline [{mode} Mode]...")
+        print(f"\n Starting Ingestion Pipeline [{mode} Mode] (chamber={chamber})...")
 
         if use_async:
             unique_bills_cnt, fetched_amdts, skipped_amdts = run_async_pipeline_wrapper(
-                db, members, existing_bill_timestamps
+                db, members, existing_bill_timestamps, chamber=chamber
             )
         else:
             unique_bills_cnt, fetched_amdts, skipped_amdts = run_sync_pipeline(
-                db, members, existing_bill_timestamps
+                db, members, existing_bill_timestamps, chamber=chamber
             )
 
     elapsed = time.time() - start_time
     print(f"\n-- Ingestion Summary --")
     print(f"  Total time elapsed: {elapsed:.2f}s")
+    print(f"  Chamber: {chamber.upper()}")
     print(f"  Members processed: {len(members)}")
     print(f"  Unique bills tracked: {unique_bills_cnt}")
     print(f"  Amendment calls made: {fetched_amdts}")
@@ -152,7 +169,7 @@ def run_ingestion(
         print(f"  {table}: {count} rows")
 
 
-def run_sync_pipeline(db, members, existing_timestamps):
+def run_sync_pipeline(db, members, existing_timestamps, chamber: str = "house"):
     """Synchronous pipeline using in-memory unique_bills dict."""
     unique_bills = {}
     skipped_amendments = 0
@@ -161,8 +178,9 @@ def run_sync_pipeline(db, members, existing_timestamps):
     # Stage 1: Load Bills & Deduplicate in Memory
     for idx, member in enumerate(members, start=1):
         bid = member["bioguideId"]
-        print(f"[{idx}/{len(members)}] Sync fetching bills for {member.get('name', bid)}...")
-        sponsored, cosponsored = fetch_legislation_for_member(bid)
+        member_chamber = member.get("chamber") or chamber
+        print(f"[{idx}/{len(members)}] Sync fetching bills for {member.get('name', bid)} ({member_chamber})...")
+        sponsored, cosponsored = fetch_legislation_for_member(bid, chamber=member_chamber)
 
         load_bills(db, sponsored, bid, "sponsor")
         load_bills(db, cosponsored, bid, "cosponsor")
@@ -198,9 +216,9 @@ def run_sync_pipeline(db, members, existing_timestamps):
 
 # ---------------- Streaming Pipeline Flow ----------------------
 
-def run_async_pipeline_wrapper(db, members, existing_timestamps):
+def run_async_pipeline_wrapper(db, members, existing_timestamps, chamber: str = "house"):
     """Wrapper to trigger asyncio event loop for async streaming engine."""
-    return asyncio.run(run_streaming_pipeline(db, members, existing_timestamps))
+    return asyncio.run(run_streaming_pipeline(db, members, existing_timestamps, chamber=chamber))
 
 async def amendment_worker(
         worker_id: int,
@@ -256,7 +274,7 @@ async def amendment_worker(
             finally:
                 queue.task_done()
 
-async def run_streaming_pipeline(db, members, existing_timestamps):
+async def run_streaming_pipeline(db, members, existing_timestamps, chamber: str = "house"):
     """
     Orchestrates streaming bill ingestion and concurrent amendment workers.
     """
@@ -279,10 +297,11 @@ async def run_streaming_pipeline(db, members, existing_timestamps):
     # 2. Producer Phase: Fetch legislation for each member
     for idx, member in enumerate(members, start=1):
         bid = member["bioguideId"]
-        print(f"[{idx}/{len(members)}] Fetching legislation for {member.get('name', bid)}...")
+        member_chamber = member.get("chamber") or chamber
+        print(f"[{idx}/{len(members)}] Fetching legislation for {member.get('name', bid)} ({member_chamber})...")
 
         # Fetch sponsored / cosponsored (can also be made async)
-        sponsored, cosponsored = fetch_legislation_for_member(bid)
+        sponsored, cosponsored = fetch_legislation_for_member(bid, chamber=member_chamber)
 
         # Write member-bill relationships immediately
         load_bills(db, sponsored, bid, "sponsor")
@@ -374,6 +393,15 @@ def start_pipeline(args):
     member_limit = None if args.full else args.limit
     random_sample = args.random
 
+    # Resolve chamber configuration
+    chamber = DEFAULT_CHAMBER
+    if getattr(args, "senate", False):
+        chamber = "senate"
+    elif getattr(args, "house", False):
+        chamber = "house"
+    elif getattr(args, "chamber", None):
+        chamber = args.chamber
+
     db = duckdb.connect(str(DB_PATH))
 
     # Setup phase (table initialization/reset)
@@ -387,6 +415,7 @@ def start_pipeline(args):
         use_async=args.use_async,
         members_only=args.members_only,
         skip_members=args.skip_members,
+        chamber=chamber,
     )
 
     db.close()

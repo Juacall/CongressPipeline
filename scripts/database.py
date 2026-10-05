@@ -144,25 +144,36 @@ def get_existing_bill_timestamps(db) -> dict[tuple[int, str, str], str]:
     return {(row[0], row[1].upper(), str(row[2])): row[3] for row in rows}
 
 
-def get_existing_members(db, member_limit: int | None = None, shuffle: bool = False) -> list[dict]:
+def get_existing_members(
+    db,
+    member_limit: int | None = None,
+    shuffle: bool = False,
+    chamber: str | None = None,
+) -> list[dict]:
     """
     Query existing members from raw_members table.
-    Returns a list of dicts with 'bioguideId', 'name', etc.
+    Returns a list of dicts with 'bioguideId', 'name', 'chamber', etc.
     """
     create_tables(db, replace=False)
     order_clause = "random()" if shuffle else "bioguide_id"
-    query = f"SELECT bioguide_id, name, state, district, party, geoid_cd FROM main.raw_members ORDER BY {order_clause}"
+    query = "SELECT bioguide_id, name, state, chamber, district, party, geoid_cd FROM main.raw_members"
+    params = []
+    if chamber and chamber.lower() in ("house", "senate"):
+        query += " WHERE LOWER(chamber) = ?"
+        params.append(chamber.lower())
+    query += f" ORDER BY {order_clause}"
     if member_limit is not None:
         query += f" LIMIT {int(member_limit)}"
-    rows = db.execute(query).fetchall()
+    rows = db.execute(query, params).fetchall() if params else db.execute(query).fetchall()
     return [
         {
             "bioguideId": row[0],
             "name": row[1],
             "state": row[2],
-            "district": row[3],
-            "partyName": row[4],
-            "_geoid_cd": row[5],
+            "chamber": row[3],
+            "district": row[4],
+            "partyName": row[5],
+            "_geoid_cd": row[6],
         }
         for row in rows
     ]

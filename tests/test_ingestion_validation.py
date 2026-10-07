@@ -12,6 +12,9 @@ from unittest.mock import patch
 # Add scripts directory to path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
+import duckdb
+
+from api import fetch_members_for_districts, fetch_senate_members_for_states
 from database import (
     check_tables_exist,
     create_tables,
@@ -97,6 +100,44 @@ def test_senate_member_ingestion():
     assert cruz[4] is None
 
     db.close()
+
+
+def test_fetch_senate_members_for_states_pagination_and_filter():
+    """Verify fetch_senate_members_for_states uses paginate and filters for senators."""
+    mock_api_members = [
+        {
+            "bioguideId": "R000614",
+            "name": "Roy, Chip",
+            "state": "TX",
+            "district": 21,
+            "terms": {"item": [{"chamber": "House of Representatives", "startYear": 2019}]},
+        },
+        {
+            "bioguideId": "C001098",
+            "name": "Cruz, Ted",
+            "state": "TX",
+            "district": None,
+            "terms": {"item": [{"chamber": "Senate", "startYear": 2013}]},
+        },
+        {
+            "bioguideId": "C001056",
+            "name": "Cornyn, John",
+            "state": "TX",
+            "district": None,
+            "terms": {"item": {"chamber": "Senate", "startYear": 2002}},  # single dict term test
+        },
+    ]
+
+    with patch("api.paginate", return_value=mock_api_members) as mock_pag:
+        # Test passing state FIPS "48" which maps to "TX"
+        senators = fetch_senate_members_for_states(["48"], member_limit=None)
+        assert len(senators) == 2
+        assert senators[0]["bioguideId"] == "C001098"
+        assert senators[0]["chamber"] == "Senate"
+        assert senators[0]["district"] is None
+        assert senators[1]["bioguideId"] == "C001056"
+        assert senators[1]["chamber"] == "Senate"
+        assert mock_pag.called
 
 
 def test_bills_ingestion_and_relationship():
@@ -211,6 +252,56 @@ def test_deterministic_vs_random_district_sampling():
     assert states == {"GA", "TX"}
 
     db.close()
+
+
+def test_get_target_districts_scope_flag():
+    """Verify use_target_counties toggles between all districts and the target subset."""
+    db = duckdb.connect(":memory:")
+    # Census crosswalk with THREE districts; target_counties covers only ONE of them.
+    db.execute("""
+        CREATE TABLE target_counties (state_fips INTEGER, county_fips INTEGER);
+        INSERT INTO target_counties VALUES (13, 115);  -- GA Floyd -> GEOID 13115
+        CREATE TABLE raw_census__cd11920_county20 (GEOID_CD119_20 VARCHAR, GEOID_COUNTY_20 VARCHAR);
+        INSERT INTO raw_census__cd11920_county20 VALUES
+            ('1314', '13115'),   -- GA-14 (in target counties)
+            ('4821', '48453'),   -- TX-21 (NOT in target counties)
+            ('0611', '06075');   -- CA-11 (NOT in target counties)
+    """)
+
+    all_districts = get_target_districts(db, use_target_counties=False)
+    assert len(all_districts) == 3
+    assert {d[0] for d in all_districts} == {"GA", "TX", "CA"}
+    # all-districts mode carries no county (one row per district)
+    assert all(d[3] is None for d in all_districts)
+
+    target_only = get_target_districts(db, use_target_counties=True)
+    assert len(target_only) == 1
+    assert target_only[0][0] == "GA"
+    assert target_only[0][1] == 14
+    db.close()
+
+
+def test_fetch_members_for_districts_exact_district_match():
+    """Verify the House fetch keeps only members whose district matches the queried one.
+
+    The Congress API district endpoint also returns neighboring-district members and
+    (for at-large /0) former House members now in the Senate (district=None). Only the
+    exact-district member must be kept, with chamber='House' and the queried geoid.
+    """
+    api_page = [
+        {"bioguideId": "P000197", "name": "Pelosi, Nancy", "district": 11},   # exact match
+        {"bioguideId": "D000623", "name": "DeSaulnier, Mark", "district": 10}, # neighbor -> drop
+        {"bioguideId": "L000571", "name": "Lummis, Cynthia", "district": None},# senator -> drop
+    ]
+    with patch("api.paginate", return_value=api_page):
+        members = fetch_members_for_districts([("CA", 11, "0611", None)], member_limit=None)
+
+    assert len(members) == 1
+    m = members[0]
+    assert m["bioguideId"] == "P000197"
+    assert m["chamber"] == "House"
+    assert m["district"] == 11
+    assert m["_geoid_cd"] == "0611"
 
 
 def test_get_existing_members():
@@ -366,6 +457,7 @@ if __name__ == "__main__":
     test_table_existence_validation()
     test_member_ingestion_and_data_validation()
     test_senate_member_ingestion()
+    test_fetch_senate_members_for_states_pagination_and_filter()
     test_bills_ingestion_and_relationship()
     test_amendments_ingestion()
     test_idempotent_duplicate_run()

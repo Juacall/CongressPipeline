@@ -12,6 +12,8 @@ import os
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = ROOT_DIR / "dev.duckdb"
 
+ENV = "STAGE"
+
 # Automatically load .env if present in root
 _env_file = ROOT_DIR / ".env"
 if _env_file.exists():

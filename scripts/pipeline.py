@@ -25,6 +25,7 @@ from api import (
     fetch_senate_members_for_states,
 )
 from config import (
+    ENV,
     BASE_URL,
     API_KEY,
     DB_PATH,
@@ -42,7 +43,7 @@ from database import (
 from ingestion import load_amendments, load_bills, load_members
 
 
-# -- Prompt Helper -------------------------------------------------------------
+# -- Prompt Helpers ------------------------------------------------------------
 
 def prompt_reset_tables() -> bool:
     """
@@ -59,21 +60,100 @@ def prompt_reset_tables() -> bool:
         print("Invalid input. Please enter 'y' (yes) or 'n' (no).")
 
 
+def prompt_refresh_mode() -> bool:
+    """
+    Prompt the user to specify whether this is a full refresh or incremental refresh.
+    Returns True for full refresh (recreates/resets tables), False for incremental refresh (preserves existing data).
+    """
+    print("\nSelect refresh mode:")
+    print("  1) Incremental refresh (preserve existing data, skip unchanged records)")
+    print("  2) Full refresh (reset/recreate raw tables)")
+
+    while True:
+        choice = input("Is this a full refresh or incremental refresh? (1=incremental, 2=full, or i/f): ").strip().lower()
+        if choice in ("1", "i", "incremental", "n", "no"):
+            print("Selected: Incremental refresh\n")
+            return False
+        elif choice in ("2", "f", "full", "y", "yes"):
+            print("Selected: Full refresh (tables will be reset)\n")
+            return True
+        print("Invalid choice. Please enter '1'/'i' for Incremental or '2'/'f' for Full refresh.")
+
+
+def prompt_use_target_counties() -> bool:
+    """
+    Prompt the user for the member scope: every congressional district (full
+    House / all states' senators) or only districts overlapping target_counties.csv.
+    Returns True to restrict to target counties, False for all districts.
+    """
+    print("\nSelect member scope:")
+    print("  1) All districts (full House and every state's senators)")
+    print("  2) Target counties only (restrict to target_counties.csv)")
+
+    while True:
+        choice = input("Scope members to target counties? (1=all, 2=target, or a/t): ").strip().lower()
+        if choice in ("1", "a", "all", "n", "no"):
+            print("Selected: All districts\n")
+            return False
+        elif choice in ("2", "t", "target", "y", "yes"):
+            print("Selected: Target counties only\n")
+            return True
+        print("Invalid choice. Please enter '1'/'a' for All districts or '2'/'t' for Target counties.")
+
+
+def prompt_ingestion_menu() -> dict | None:
+    """
+    Display interactive menu for selecting the ingestion pipeline task.
+    Returns a dict with 'chamber', 'members_only', and 'skip_members' configuration,
+    or None if the user chooses to exit.
+    """
+    print("\n" + "=" * 55)
+    print("           CONGRESS INGESTION PIPELINE")
+    print("=" * 55)
+    print("Please select which task to run:")
+    print("  1) House Members Only")
+    print("  2) Senate Members Only")
+    print("  3) House Bills and Amendments")
+    print("  4) Senate Bills and Amendments")
+    print("  5) All (Both Chambers - Members, Bills & Amendments)")
+    print("  6) Exit")
+    print("=" * 55)
+
+    options = {
+        "1": {"chamber": "house", "members_only": True, "skip_members": False, "label": "House Members Only"},
+        "2": {"chamber": "senate", "members_only": True, "skip_members": False, "label": "Senate Members Only"},
+        "3": {"chamber": "house", "members_only": False, "skip_members": True, "label": "House Bills and Amendments"},
+        "4": {"chamber": "senate", "members_only": False, "skip_members": True, "label": "Senate Bills and Amendments"},
+        "5": {"chamber": "both", "members_only": False, "skip_members": True, "label": "All (Both Chambers - Members, Bills & Amendments)"},
+    }
+
+    while True:
+        choice = input("Enter choice [1-6]: ").strip().lower()
+        if choice in options:
+            selected = options[choice]
+            print(f"Selected: {selected['label']}")
+            return selected
+        elif choice in ("6", "q", "quit", "exit"):
+            print("Exiting pipeline.")
+            return None
+        print("Invalid choice. Please enter a number from 1 to 6 (or 'q' to exit).")
+
+
 # -- Setup ---------------------------------------------------------------------
 
 def setup_database(db, reset: bool | None = None):
     """
     Initialize database tables.
-    If reset is explicitly provided (True/False via CLI), use it.
+    If reset is explicitly provided (True/False via CLI or interactive prompt), use it.
     Otherwise, interactively prompt the user.
     """
     if reset is None:
-        should_reset = prompt_reset_tables()
+        should_reset = prompt_refresh_mode()
     else:
         should_reset = reset
 
     if should_reset:
-        print("Recreating raw tables (reset mode)...")
+        print("Recreating raw tables (reset/full refresh mode)...")
         create_tables(db, replace=True)
     else:
         print("Ensuring raw tables exist (incremental/preserve mode)...")
@@ -90,15 +170,23 @@ def run_ingestion(
         members_only: bool = False,
         skip_members: bool = False,
         chamber: str = DEFAULT_CHAMBER,
+        use_target_counties: bool = False,
 ):
     """Fetch data from Congress API and ingest into database tables incrementally."""
     start_time = time.time()
     chamber = (chamber or DEFAULT_CHAMBER).lower()
 
-    # Validate prerequisite tables before running
-    if not validate_seed_tables(db):
+    # Validate prerequisite tables before running. The census crosswalk is always
+    # required; the target_counties seed is only needed when scoping to it.
+    if use_target_counties:
+        if not validate_seed_tables(db):
+            raise RuntimeError(
+                "Prerequisite seed tables ('target_counties', 'raw_census__cd11920_county20') are missing. "
+                "Please run 'uv run dbt seed' from the dbt/ directory first."
+            )
+    elif not check_tables_exist(db, ["raw_census__cd11920_county20"]):
         raise RuntimeError(
-            "Prerequisite seed tables ('target_counties', 'raw_census__cd11920_county20') are missing. "
+            "Prerequisite seed table 'raw_census__cd11920_county20' is missing. "
             "Please run 'uv run dbt seed' from the dbt/ directory first."
         )
 
@@ -108,13 +196,15 @@ def run_ingestion(
 
     limit_desc = "ALL" if member_limit is None else str(member_limit)
 
+    member_stats = None
     if skip_members:
         print(f"\nSkipping member API fetch. Loading existing members from raw_members table (chamber={chamber}, limit={limit_desc}, random={random_sample})...")
         members = get_existing_members(db, member_limit=member_limit, shuffle=random_sample, chamber=chamber if chamber != "both" else None)
         print(f"Loaded {len(members)} member(s) from database.")
     else:
-        print(f"\nReading target districts from seed tables (random={random_sample})...")
-        target_districts = get_target_districts(db, shuffle=random_sample)
+        scope_desc = "target counties (target_counties.csv)" if use_target_counties else "ALL districts"
+        print(f"\nReading districts from seed tables — scope: {scope_desc} (random={random_sample})...")
+        target_districts = get_target_districts(db, shuffle=random_sample, use_target_counties=use_target_counties)
 
         members = []
         if chamber in ("house", "both"):
@@ -130,7 +220,7 @@ def run_ingestion(
                 senate_members = fetch_senate_members_for_states(target_states, member_limit=senate_limit)
                 members.extend(senate_members)
 
-        load_members(db, members)
+        member_stats = load_members(db, members)
 
     if members_only:
         print("\n'--members-only' flag specified. Skipping bills and amendments ingestion.")
@@ -158,7 +248,13 @@ def run_ingestion(
     print(f"\n-- Ingestion Summary --")
     print(f"  Total time elapsed: {elapsed:.2f}s")
     print(f"  Chamber: {chamber.upper()}")
-    print(f"  Members processed: {len(members)}")
+    print(f"  Members fetched: {len(members)}")
+    if member_stats is not None:
+        print(f"    - New (inserted):          {member_stats['inserted']}")
+        print(f"    - Changed (updated):       {member_stats['updated']}")
+        print(f"    - Unchanged (write skipped): {member_stats['unchanged']}")
+    else:
+        print(f"    (members loaded from DB; no upsert performed)")
     print(f"  Unique bills tracked: {unique_bills_cnt}")
     print(f"  Amendment calls made: {fetched_amdts}")
     print(f"  Amendment calls skipped (unchanged): {skipped_amdts}")
@@ -195,8 +291,11 @@ def run_sync_pipeline(db, members, existing_timestamps, chamber: str = "house"):
     for idx, ((congress, bill_type, bill_number), bill) in enumerate(unique_bills.items(), start=1):
         key = (congress, bill_type, bill_number)
         bill_ref = f"{congress}-{bill_type}-{bill_number}"
-        current_update = parse_api_date(bill.get("updateDate") or bill.get("updateDateIncludingText"))
-        previous_update = existing_timestamps.get(key)
+        # The list endpoint has no bill updateDate; use latestAction.actionDate as
+        # the change signal (matches raw_bills.latest_action_date in the baseline).
+        # latest_action_date is stored as a VARCHAR, so parse both sides to datetime.
+        current_update = parse_api_date((bill.get("latestAction") or {}).get("actionDate"))
+        previous_update = parse_api_date(existing_timestamps.get(key))
 
         if previous_update and current_update and current_update <= previous_update:
             skipped_amendments += 1
@@ -243,8 +342,10 @@ async def amendment_worker(
         bill_ref = f"{congress}-{bill_type}-{bill_number}"
 
         # 1. Fast In-Memory Timestamp Delta Check
+        # update_date_raw is the bill's latestAction.actionDate; the baseline holds
+        # latest_action_date as a VARCHAR, so parse both sides to datetime.
         current_update = parse_api_date(update_date_raw)
-        previous_update = existing_timestamps.get(key)
+        previous_update = parse_api_date(existing_timestamps.get(key))
 
         if previous_update and current_update and current_update <= previous_update:
             stats["skipped_amendments"] += 1
@@ -316,7 +417,9 @@ async def run_streaming_pipeline(db, members, existing_timestamps, chamber: str 
 
             if key not in unique_bills_seen:
                 unique_bills_seen.add(key)
-                update_date_raw = bill.get("updateDate") or bill.get("updateDateIncludingText")
+                # The list endpoint has no bill updateDate; use latestAction.actionDate
+                # as the change signal (matches raw_bills.latest_action_date baseline).
+                update_date_raw = (bill.get("latestAction") or {}).get("actionDate")
 
                 # Push bill into queue (blocks if queue reaches maxsize)
                 await queue.put((congress, bill_type, bill_number, update_date_raw))
@@ -390,32 +493,70 @@ def _flush_batch_to_duckdb(db, batch: list[tuple]):
         print(f"[DB Writer] Error flushing batch of {len(batch)}: {e}")
 
 def start_pipeline(args):
-    member_limit = None if args.full else args.limit
-    random_sample = args.random
+    member_limit = None if ENV != 'Dev' else 5
+    random_sample = getattr(args, "random", False)
 
-    # Resolve chamber configuration
-    chamber = DEFAULT_CHAMBER
-    if getattr(args, "senate", False):
-        chamber = "senate"
-    elif getattr(args, "house", False):
-        chamber = "house"
-    elif getattr(args, "chamber", None):
-        chamber = args.chamber
+    # Member scope: None = not specified on the CLI (decide below), else explicit.
+    use_target_counties = getattr(args, "target_counties", None)
+
+    # Check if explicit mode/chamber CLI flags were passed
+    has_explicit_cli_flags = any([
+        getattr(args, "house", False),
+        getattr(args, "senate", False),
+        getattr(args, "chamber", None) is not None,
+        getattr(args, "members_only", False),
+        getattr(args, "skip_members", False),
+    ])
+
+    reset = getattr(args, "reset", None)
+
+    if not has_explicit_cli_flags:
+        # Prompt user with the interactive menu
+        selection = prompt_ingestion_menu()
+        if selection is None:
+            return  # User selected Exit
+        chamber = selection["chamber"]
+        members_only = selection["members_only"]
+        skip_members = selection["skip_members"]
+
+        # Prompt right after the menu for full refresh vs incremental refresh if not specified via CLI
+        if reset is None:
+            reset = prompt_refresh_mode()
+
+        # Prompt for member scope (all districts vs target counties) if not set via CLI
+        if use_target_counties is None:
+            use_target_counties = prompt_use_target_counties()
+    else:
+        # Resolve chamber configuration from CLI arguments
+        chamber = DEFAULT_CHAMBER
+        if getattr(args, "senate", False):
+            chamber = "senate"
+        elif getattr(args, "house", False):
+            chamber = "house"
+        elif getattr(args, "chamber", None):
+            chamber = args.chamber
+        members_only = getattr(args, "members_only", False)
+        skip_members = getattr(args, "skip_members", False)
+
+    # Default to all districts when scope was not specified via CLI.
+    if use_target_counties is None:
+        use_target_counties = False
 
     db = duckdb.connect(str(DB_PATH))
 
     # Setup phase (table initialization/reset)
-    setup_database(db, reset=args.reset)
+    setup_database(db, reset=reset)
 
     # Ingestion phase
     run_ingestion(
         db,
         member_limit=member_limit,
         random_sample=random_sample,
-        use_async=args.use_async,
-        members_only=args.members_only,
-        skip_members=args.skip_members,
+        use_async=getattr(args, "use_async", False),
+        members_only=members_only,
+        skip_members=skip_members,
         chamber=chamber,
+        use_target_counties=use_target_counties,
     )
 
     db.close()

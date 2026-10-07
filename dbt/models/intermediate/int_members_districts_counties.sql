@@ -1,29 +1,46 @@
 -- int_members_districts_counties.sql
---
--- GRAIN: one row per member x county.
---
--- Links House members to the target counties in their districts. A district
--- can overlap multiple target counties, so a member may appear more than once.
---
--- county_fips is the full 5-digit FIPS (state + county) e.g. '13047'
+-- GRAIN: one row per member x county (Nationwide).
+
 {{ config(materialized = 'table') }}
 
-select distinct
-    m.member_id,
-    m.member_name,
-    m.state_code,
-    m.district_number,
-    m.party_name,
-    m.geoid_cd,
-    lpad(cast(tc.state_fips  as varchar), 2, '0')
-    || lpad(cast(tc.county_fips as varchar), 3, '0') as county_fips,
-    tc.county_name,
-    tc.state as county_state
-from {{ ref('stg_members') }} as m
-inner join {{ ref('raw_census__cd11920_county20') }} as census
-    on m.geoid_cd = census.GEOID_CD119_20
-inner join {{ ref('target_counties') }} as tc
-    on census.GEOID_COUNTY_20 =
-       lpad(cast(tc.state_fips  as varchar), 2, '0')
-    || lpad(cast(tc.county_fips as varchar), 3, '0')
-where lower(m.chamber) = 'house'
+with house_members as (
+
+    select distinct
+        m.member_id,
+        m.chamber,
+        m.member_name,
+        m.state_code,
+        m.district_number,
+        m.party_name,
+        m.geoid_cd,
+        census.GEOID_COUNTY_20 as county_fips
+    from {{ ref('stg_members') }} as m
+    inner join {{ ref('raw_census__cd11920_county20') }} as census
+        on m.geoid_cd = census.GEOID_CD119_20
+    where lower(m.chamber) = 'house'
+
+),
+
+senate_members as (
+
+    select distinct
+        m.member_id,
+        m.chamber,
+        m.member_name,
+        m.state_code,
+        m.district_number,  -- NULL for Senators
+        m.party_name,
+        m.geoid_cd,          -- NULL for Senators
+        census.GEOID_COUNTY_20 as county_fips
+    from {{ ref('stg_members') }} as m
+    inner join {{ ref('raw_census__cd11920_county20') }} as census
+        -- Senators represent all counties in their state (matching state FIPS code)
+        on upper(m.state_code) = upper(census.STATE_ABBR)
+        or lpad(cast(census.STATE_FIPS as varchar), 2, '0') = upper(m.state_code)
+    where lower(m.chamber) = 'senate'
+
+)
+
+select * from house_members
+union all
+select * from senate_members

@@ -130,15 +130,22 @@ def create_tables(db, replace: bool = False):
 
 def get_existing_bill_timestamps(db) -> dict[tuple[int, str, str], str]:
     """
-    Query existing bills and return a map of (congress, bill_type, bill_number) -> update_date.
+    Query existing bills and return a map of (congress, bill_type, bill_number) -> latest_action_date.
     Used for incremental change detection before fetching amendments.
+
+    Note: we key the delta off `latest_action_date`, not `update_date`. The
+    sponsored/cosponsored *list* endpoint (what the pipeline fetches) does not
+    return a bill `updateDate` at all — only `latestAction.actionDate` — so
+    `update_date` is always NULL here and can never serve as a change signal.
+    `latest_action_date` is stored as a 'YYYY-MM-DD' string, so a lexical MAX is
+    also chronological.
     """
     # Ensure table exists first
     create_tables(db, replace=False)
     rows = db.execute("""
-        SELECT congress, bill_type, bill_number, MAX(update_date) as max_update
+        SELECT congress, bill_type, bill_number, MAX(latest_action_date) as max_update
         FROM main.raw_bills
-        WHERE update_date IS NOT NULL
+        WHERE latest_action_date IS NOT NULL
         GROUP BY congress, bill_type, bill_number
     """).fetchall()
     return {(row[0], row[1].upper(), str(row[2])): row[3] for row in rows}
@@ -179,39 +186,68 @@ def get_existing_members(
     ]
 
 
-def get_target_districts(db, shuffle: bool = False):
+def get_target_districts(db, shuffle: bool = False, use_target_counties: bool = False):
     """
-    Join the two seed tables to find all congressional districts that overlap
-    at least one of the 350 target counties.
+    Return the list of congressional districts to ingest members for.
+
+    By default (use_target_counties=False) this returns EVERY congressional
+    district present in the census crosswalk (i.e. the full House, and — because
+    the Senate fetch derives its states from this list — every state's senators).
+
+    When use_target_counties=True, the result is restricted to districts that
+    overlap at least one of the counties in the target_counties seed (the
+    previous default scope of ~226 districts across 45 states).
+
+    Each returned tuple is (state_abbr, district_num, geoid_cd, geoid_county).
+    geoid_county is a representative county used only for logging; it is None in
+    all-districts mode (one row per district, no county join).
 
     Args:
         db: DuckDB connection
-        shuffle: If True, uses random() ordering to randomly select districts based on limit.
+        shuffle: If True, uses random() ordering (random sampling up to a limit).
                  If False (default), orders deterministically by GEOID.
+        use_target_counties: If True, restrict to target_counties.csv overlap.
     """
-    if not validate_seed_tables(db):
-        raise RuntimeError(
-            "Prerequisite seed tables ('target_counties', 'raw_census__cd11920_county20') are missing. "
-            "Please run 'uv run dbt seed' from the dbt/ directory first."
-        )
-
-    order_clause = "random()" if shuffle else "census.GEOID_CD119_20, census.GEOID_COUNTY_20"
-
-    rows = db.execute(f"""
-        SELECT DISTINCT
-            census.GEOID_CD119_20,
-            census.GEOID_COUNTY_20,
-            LEFT(census.GEOID_CD119_20, 2)                    AS state_fips,
-            CAST(RIGHT(census.GEOID_CD119_20, 2) AS INTEGER)  AS district_num
-        FROM raw_census__cd11920_county20 AS census
-        INNER JOIN target_counties AS tc
-            ON census.GEOID_COUNTY_20 =
-               LPAD(CAST(tc.state_fips AS VARCHAR), 2, '0')
-               || LPAD(CAST(tc.county_fips AS VARCHAR), 3, '0')
-        WHERE census.GEOID_CD119_20 NOT LIKE '%ZZ'  -- exclude non-voting delegate districts
-        ORDER BY
-            {order_clause}
-    """).fetchall()
+    if use_target_counties:
+        if not validate_seed_tables(db):
+            raise RuntimeError(
+                "Prerequisite seed tables ('target_counties', 'raw_census__cd11920_county20') are missing. "
+                "Please run 'uv run dbt seed' from the dbt/ directory first."
+            )
+        order_clause = "random()" if shuffle else "census.GEOID_CD119_20, census.GEOID_COUNTY_20"
+        rows = db.execute(f"""
+            SELECT DISTINCT
+                census.GEOID_CD119_20,
+                census.GEOID_COUNTY_20,
+                LEFT(census.GEOID_CD119_20, 2)                    AS state_fips,
+                CAST(RIGHT(census.GEOID_CD119_20, 2) AS INTEGER)  AS district_num
+            FROM raw_census__cd11920_county20 AS census
+            INNER JOIN target_counties AS tc
+                ON census.GEOID_COUNTY_20 =
+                   LPAD(CAST(tc.state_fips AS VARCHAR), 2, '0')
+                   || LPAD(CAST(tc.county_fips AS VARCHAR), 3, '0')
+            WHERE census.GEOID_CD119_20 NOT LIKE '%ZZ'  -- exclude non-voting delegate districts
+            ORDER BY
+                {order_clause}
+        """).fetchall()
+    else:
+        if not check_tables_exist(db, ["raw_census__cd11920_county20"]):
+            raise RuntimeError(
+                "Prerequisite seed table 'raw_census__cd11920_county20' is missing. "
+                "Please run 'uv run dbt seed' from the dbt/ directory first."
+            )
+        order_clause = "random()" if shuffle else "GEOID_CD119_20"
+        rows = db.execute(f"""
+            SELECT DISTINCT
+                census.GEOID_CD119_20,
+                NULL                                              AS geoid_county,
+                LEFT(census.GEOID_CD119_20, 2)                    AS state_fips,
+                CAST(RIGHT(census.GEOID_CD119_20, 2) AS INTEGER)  AS district_num
+            FROM raw_census__cd11920_county20 AS census
+            WHERE census.GEOID_CD119_20 NOT LIKE '%ZZ'  -- exclude non-voting delegate districts
+            ORDER BY
+                {order_clause}
+        """).fetchall()
 
     districts = []
     seen_states = set()
@@ -222,5 +258,6 @@ def get_target_districts(db, shuffle: bool = False):
             districts.append((state_abbr, district_num, geoid_cd, geoid_county))
             seen_states.add(state_abbr)
 
-    print(f"Found {len(districts)} target districts across {len(seen_states)} states")
+    scope = "target-county" if use_target_counties else "all"
+    print(f"Found {len(districts)} {scope} districts across {len(seen_states)} states")
     return districts

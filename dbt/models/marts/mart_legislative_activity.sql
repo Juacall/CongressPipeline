@@ -33,6 +33,7 @@ select
 -- Target-district member connected to this activity via bill ownership
     mdc.member_id                               as target_member_id,
     mdc.member_name                             as target_member_name,
+    mdc.chamber                                 as target_member_chamber,
     mdc.state_code                              as target_member_state,
     mdc.district_number                         as target_member_district,
     mdc.party_name                              as target_member_party,
@@ -52,6 +53,7 @@ select
     la.amendment_title,                         -- null for bills
 -- Who proposed the amendment (null for bills, null if outside target districts)
     la.amendment_sponsor_id,
+    amend_sponsor.chamber                       as amendment_sponsor_chamber_if_target,
     amend_sponsor.member_name                   as amendment_sponsor_name_if_target,
     amend_sponsor.state_code                    as amendment_sponsor_state_if_target,
     amend_sponsor.party_name                    as amendment_sponsor_party_if_target

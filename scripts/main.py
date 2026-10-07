@@ -17,7 +17,12 @@ from config import (
     DEFAULT_CHAMBER,
     MEMBER_LIMIT as DEFAULT_MEMBER_LIMIT,
 )
-from pipeline import prompt_reset_tables, start_pipeline
+from pipeline import (
+    prompt_ingestion_menu,
+    prompt_refresh_mode,
+    prompt_reset_tables,
+    start_pipeline,
+)
 
 # ── CLI & Main ────────────────────────────────────────────────────────────────
 
@@ -89,6 +94,21 @@ def parse_args():
         choices=["house", "senate", "both"],
         default=None,
         help=f"Specify chamber: 'house', 'senate', or 'both' (default from config: '{DEFAULT_CHAMBER}').",
+    )
+
+    # Member scope: all districts (default) vs restricted to target_counties.csv
+    parser.add_argument(
+        "--target-counties",
+        action="store_true",
+        default=None,
+        dest="target_counties",
+        help="Restrict member ingestion to districts overlapping target_counties.csv.",
+    )
+    parser.add_argument(
+        "--all-districts",
+        action="store_false",
+        dest="target_counties",
+        help="Ingest members for every congressional district / all states (default).",
     )
 
     return parser.parse_args()

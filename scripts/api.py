@@ -16,9 +16,25 @@ import requests
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 try:
-    from config import API_KEY, BASE_URL, CONGRESS, HOUSE_BILL_TYPES, SENATE_BILL_TYPES, MEMBER_LIMIT
+    from config import (
+        API_KEY,
+        BASE_URL,
+        CONGRESS,
+        HOUSE_BILL_TYPES,
+        SENATE_BILL_TYPES,
+        MEMBER_LIMIT,
+        STATE_FIPS_TO_ABBR,
+    )
 except ImportError:
-    from scripts.config import API_KEY, BASE_URL, CONGRESS, HOUSE_BILL_TYPES, SENATE_BILL_TYPES, MEMBER_LIMIT
+    from scripts.config import (
+        API_KEY,
+        BASE_URL,
+        CONGRESS,
+        HOUSE_BILL_TYPES,
+        SENATE_BILL_TYPES,
+        MEMBER_LIMIT,
+        STATE_FIPS_TO_ABBR,
+    )
 
 
 def api_get(url: str, params: dict | None = None, retries: int = 5) -> dict:
@@ -107,6 +123,14 @@ def fetch_members_for_districts(districts: list, member_limit: int | None = MEMB
             bid = m.get("bioguideId")
             if not bid or bid in seen_ids:
                 continue
+            # The Congress API district endpoint is not an exact filter: for some
+            # states it also returns neighboring-district members, and the at-large
+            # endpoint (/{state}/0) returns former House members who are now senators
+            # (district=None). Keep only the member whose own district matches the one
+            # we queried — this both excludes senators and ensures each member is tied
+            # to the correct district (so _geoid_cd for the census join is accurate).
+            if m.get("district") != district_num:
+                continue
             seen_ids.add(bid)
             m["chamber"] = "House"
             m["_geoid_cd"] = geoid_cd  # carry the geoid forward for the census join
@@ -119,17 +143,23 @@ def fetch_members_for_districts(districts: list, member_limit: int | None = MEMB
 
 def fetch_senate_members_for_states(states: list[str], member_limit: int | None = MEMBER_LIMIT) -> list:
     """
-    For each target state, fetch Senate members from the Congress API scoped
-    to the target Congress.
+    For each target state (abbreviation or FIPS code), fetch Senate members from the
+    Congress API scoped to the target Congress using pagination.
 
     Endpoint: /member/congress/{congress}/{stateCode}
     """
     members = []
     seen_ids = set()
 
-    for state_abbr in states:
+    for state in states:
         if member_limit and len(members) >= member_limit:
             break
+
+        state_str = str(state).strip()
+        state_abbr = STATE_FIPS_TO_ABBR.get(
+            state_str.zfill(2) if state_str.isdigit() else state_str.upper(),
+            state_str.upper(),
+        )
 
         url = f"{BASE_URL}/member/congress/{CONGRESS}/{state_abbr}"
         try:
@@ -139,15 +169,24 @@ def fetch_senate_members_for_states(states: list[str], member_limit: int | None 
             continue
 
         for m in page:
-            # Check if this member is a Senator (no district assigned or terms/chamber indicates Senate)
+            # Safely parse member terms payload
             terms = m.get("terms", {})
-            term_items = terms.get("item", []) if isinstance(terms, dict) else []
+            if isinstance(terms, dict):
+                item = terms.get("item", [])
+                term_items = [item] if isinstance(item, dict) else (item if isinstance(item, list) else [])
+            elif isinstance(terms, list):
+                term_items = terms
+            else:
+                term_items = []
+
+            latest_term = term_items[-1] if term_items else {}
+            latest_chamber = latest_term.get("chamber") if isinstance(latest_term, dict) else None
+
+            # Check if member is a Senator (no district assigned or active term chamber is Senate)
             is_senate = False
-            if m.get("district") is None or m.get("district") == "":
+            if latest_chamber == "Senate" or m.get("chamber") == "Senate":
                 is_senate = True
-            elif any(isinstance(t, dict) and t.get("chamber") == "Senate" for t in term_items):
-                is_senate = True
-            elif m.get("chamber") == "Senate":
+            elif m.get("district") is None and latest_chamber != "House of Representatives":
                 is_senate = True
 
             if not is_senate:

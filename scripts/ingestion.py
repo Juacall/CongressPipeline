@@ -19,9 +19,15 @@ def load_members(db, members):
     """
     Idempotently upsert member rows into raw_members.
     Primary Key: (bioguide_id).
+
+    Returns a stats dict describing the incremental outcome:
+      {"total", "inserted", "updated", "unchanged"}
+    - inserted:  bioguide_id not previously in raw_members
+    - updated:   existed, but row_hash changed (content differs)
+    - unchanged: existed with identical row_hash (write skipped by the ON CONFLICT WHERE clause)
     """
     if not members:
-        return
+        return {"total": 0, "inserted": 0, "updated": 0, "unchanged": 0}
 
     now_iso = datetime.now(timezone.utc).isoformat()
     rows = []
@@ -37,6 +43,31 @@ def load_members(db, members):
 
         row_hash = _compute_hash(bid, name, state, chamber, district, party, geoid_cd)
         rows.append((bid, name, state, chamber, district, party, geoid_cd, update_date, row_hash, now_iso))
+
+    # Classify each incoming row against what's already stored so the caller can
+    # report new / changed / unchanged counts. Done before the upsert because the
+    # ON CONFLICT WHERE clause silently skips unchanged rows (no affected-row signal).
+    existing_hashes = {}
+    bids = [r[0] for r in rows if r[0] is not None]
+    if bids:
+        placeholders = ",".join("?" for _ in bids)
+        existing_hashes = {
+            bid: h
+            for bid, h in db.execute(
+                f"SELECT bioguide_id, row_hash FROM main.raw_members WHERE bioguide_id IN ({placeholders})",
+                bids,
+            ).fetchall()
+        }
+
+    inserted = updated = unchanged = 0
+    for r in rows:
+        bid, new_hash = r[0], r[8]
+        if bid not in existing_hashes:
+            inserted += 1
+        elif existing_hashes[bid] != new_hash:
+            updated += 1
+        else:
+            unchanged += 1
 
     db.executemany("""
         INSERT INTO main.raw_members (
@@ -54,6 +85,13 @@ def load_members(db, members):
             ingested_at = EXCLUDED.ingested_at
         WHERE main.raw_members.row_hash != EXCLUDED.row_hash
     """, rows)
+
+    return {
+        "total": len(rows),
+        "inserted": inserted,
+        "updated": updated,
+        "unchanged": unchanged,
+    }
 
 
 def load_bills(db, bills, member_id, relationship):

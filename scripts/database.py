@@ -47,7 +47,7 @@ def validate_seed_tables(db) -> bool:
     return check_tables_exist(db, required_seeds)
 
 
-def create_tables(db, replace: bool = False):
+def create_tables(db, replace: bool = False, replace_tables: list[str] | None = None):
     """
     Initialize raw tables in DuckDB with primary keys and checksum/timestamp tracking.
 
@@ -55,11 +55,22 @@ def create_tables(db, replace: bool = False):
     - raw_members:    one row per target-district House member only
     - raw_bills:      one row per member-bill relationship (sponsor or cosponsor)
     - raw_amendments: all amendments to target bills, regardless of sponsor
+
+    When ``replace`` is true, ``replace_tables`` optionally limits which raw
+    tables are recreated. If omitted, all raw tables are replaced.
     """
-    create_stmt = "CREATE OR REPLACE TABLE" if replace else "CREATE TABLE IF NOT EXISTS"
+    raw_tables = {"raw_members", "raw_bills", "raw_amendments"}
+    tables_to_replace = raw_tables if replace_tables is None else set(replace_tables)
+    unknown_tables = tables_to_replace - raw_tables
+    if unknown_tables:
+        raise ValueError(f"Unknown raw table(s) requested for replacement: {', '.join(sorted(unknown_tables))}")
+
+    def create_stmt(table_name: str) -> str:
+        should_replace = replace and table_name in tables_to_replace
+        return "CREATE OR REPLACE TABLE" if should_replace else "CREATE TABLE IF NOT EXISTS"
 
     db.execute(f"""
-        {create_stmt} main.raw_members (
+        {create_stmt("raw_members")} main.raw_members (
             bioguide_id   VARCHAR,
             name          VARCHAR,
             state         VARCHAR,
@@ -74,7 +85,7 @@ def create_tables(db, replace: bool = False):
         )
     """)
     db.execute(f"""
-        {create_stmt} main.raw_bills (
+        {create_stmt("raw_bills")} main.raw_bills (
             congress            INTEGER,
             bill_type           VARCHAR,
             bill_number         VARCHAR,
@@ -90,7 +101,7 @@ def create_tables(db, replace: bool = False):
         )
     """)
     db.execute(f"""
-        {create_stmt} main.raw_amendments (
+        {create_stmt("raw_amendments")} main.raw_amendments (
             congress          INTEGER,
             bill_type         VARCHAR,
             bill_number       VARCHAR,
@@ -108,7 +119,7 @@ def create_tables(db, replace: bool = False):
 
     db.execute(f"""
             -- Track execution lifecycle
-         {create_stmt} main.ingestion_runs (
+         CREATE TABLE IF NOT EXISTS main.ingestion_runs (
             run_id VARCHAR PRIMARY KEY,
             started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             completed_at TIMESTAMP,
@@ -118,7 +129,7 @@ def create_tables(db, replace: bool = False):
 
     db.execute(f"""
             -- Track completed operational steps to allow seamless resumes
-             {create_stmt} main.ingestion_step_history (
+             CREATE TABLE IF NOT EXISTS main.ingestion_step_history (
                 run_id VARCHAR,
                 step_type VARCHAR,  -- 'MEMBER_BILLS', 'BILL_AMENDMENTS'
                 entity_key VARCHAR, -- e.g., 'bioguide_id' or '119-HR-1234'

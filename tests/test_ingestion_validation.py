@@ -35,7 +35,7 @@ from mock_data import (
     MOCK_SPONSORED_BILLS,
     create_in_memory_db_with_seeds,
 )
-from pipeline import run_ingestion
+from pipeline import run_ingestion, setup_database
 
 
 def test_table_existence_validation():
@@ -48,6 +48,36 @@ def test_table_existence_validation():
 
     # Non-existent table should return False
     assert check_tables_exist(db, ["non_existent_table"]) is False
+    db.close()
+
+
+def test_full_refresh_replaces_only_selected_raw_tables():
+    """A targeted full refresh preserves other raw tables and run history."""
+    db = create_in_memory_db_with_seeds()
+    db.execute("INSERT INTO main.raw_members (bioguide_id) VALUES ('M000001')")
+    db.execute("""
+        INSERT INTO main.raw_bills
+        (congress, bill_type, bill_number, member_id, relationship)
+        VALUES (119, 'HR', '1', 'M000001', 'sponsor')
+    """)
+    db.execute("""
+        INSERT INTO main.raw_amendments
+        (congress, bill_type, bill_number, amendment_number, amendment_type)
+        VALUES (119, 'HR', '1', '1', 'HAM')
+    """)
+    db.execute("""
+        INSERT INTO main.ingestion_runs (run_id, status)
+        VALUES ('existing-run', 'COMPLETED')
+    """)
+
+    setup_database(db, reset=True, reset_tables=["raw_bills"])
+
+    assert db.execute("SELECT COUNT(*) FROM main.raw_members").fetchone()[0] == 1
+    assert db.execute("SELECT COUNT(*) FROM main.raw_bills").fetchone()[0] == 0
+    assert db.execute("SELECT COUNT(*) FROM main.raw_amendments").fetchone()[0] == 1
+    assert db.execute(
+        "SELECT COUNT(*) FROM main.ingestion_runs WHERE run_id = 'existing-run'"
+    ).fetchone()[0] == 1
     db.close()
 
 

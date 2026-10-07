@@ -141,11 +141,16 @@ def prompt_ingestion_menu() -> dict | None:
 
 # -- Setup ---------------------------------------------------------------------
 
-def setup_database(db, reset: bool | None = None):
+def setup_database(
+        db,
+        reset: bool | None = None,
+        reset_tables: list[str] | None = None,
+):
     """
     Initialize database tables.
     If reset is explicitly provided (True/False via CLI or interactive prompt), use it.
     Otherwise, interactively prompt the user.
+    On a full refresh, reset only the requested raw tables.
     """
     if reset is None:
         should_reset = prompt_refresh_mode()
@@ -153,8 +158,14 @@ def setup_database(db, reset: bool | None = None):
         should_reset = reset
 
     if should_reset:
-        print("Recreating raw tables (reset/full refresh mode)...")
-        create_tables(db, replace=True)
+        tables = reset_tables if reset_tables is not None else [
+            "raw_members", "raw_bills", "raw_amendments"
+        ]
+        if tables:
+            print(f"Recreating raw table(s) (full refresh mode): {', '.join(tables)}...")
+        else:
+            print("Full refresh selected, but this task does not ingest into a raw table.")
+        create_tables(db, replace=True, replace_tables=tables)
     else:
         print("Ensuring raw tables exist (incremental/preserve mode)...")
         create_tables(db, replace=False)
@@ -545,7 +556,12 @@ def start_pipeline(args):
     db = duckdb.connect(str(DB_PATH))
 
     # Setup phase (table initialization/reset)
-    setup_database(db, reset=reset)
+    reset_tables = []
+    if not skip_members:
+        reset_tables.append("raw_members")
+    if not members_only:
+        reset_tables.extend(["raw_bills", "raw_amendments"])
+    setup_database(db, reset=reset, reset_tables=reset_tables)
 
     # Ingestion phase
     run_ingestion(

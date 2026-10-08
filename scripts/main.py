@@ -33,7 +33,7 @@ def parse_args():
     parser.add_argument(
         "--full",
         action="store_true",
-        help="Run ingestion for all target district members (no limit).",
+        help="Run ingestion for all current Congress members (no limit).",
     )
     parser.add_argument(
         "--limit",
@@ -44,7 +44,7 @@ def parse_args():
     parser.add_argument(
         "--random",
         action="store_true",
-        help="Randomly sample districts/members up to --limit instead of deterministic order.",
+        help="Randomly sample current Congress members up to --limit.",
     )
     parser.add_argument(
         "--reset",
@@ -65,10 +65,21 @@ def parse_args():
         help="Run ingestion using async HTTP workers and streaming queue.",
     )
 
-    parser.add_argument(
+    ingestion_group = parser.add_mutually_exclusive_group()
+    ingestion_group.add_argument(
         "--members-only",
         action="store_true",
         help="Only fetch and update raw_members metadata; skip bills and amendments.",
+    )
+    ingestion_group.add_argument(
+        "--bills-only",
+        action="store_true",
+        help="Fetch and update raw_bills only; do not fetch amendments.",
+    )
+    ingestion_group.add_argument(
+        "--amendments-only",
+        action="store_true",
+        help="Fetch amendments for bills already stored in raw_bills.",
     )
     parser.add_argument(
         "--skip-members",
@@ -94,21 +105,6 @@ def parse_args():
         choices=["house", "senate", "both"],
         default=None,
         help=f"Specify chamber: 'house', 'senate', or 'both' (default from config: '{DEFAULT_CHAMBER}').",
-    )
-
-    # Member scope: all districts (default) vs restricted to target_counties.csv
-    parser.add_argument(
-        "--target-counties",
-        action="store_true",
-        default=None,
-        dest="target_counties",
-        help="Restrict member ingestion to districts overlapping target_counties.csv.",
-    )
-    parser.add_argument(
-        "--all-districts",
-        action="store_false",
-        dest="target_counties",
-        help="Ingest members for every congressional district / all states (default).",
     )
 
     return parser.parse_args()

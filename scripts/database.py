@@ -39,20 +39,12 @@ def check_tables_exist(db, tables: list[str] = None) -> bool:
     return True
 
 
-def validate_seed_tables(db) -> bool:
-    """
-    Validate that the prerequisite dbt seed tables exist.
-    """
-    required_seeds = ["target_counties", "raw_census__cd11920_county20"]
-    return check_tables_exist(db, required_seeds)
-
-
 def create_tables(db, replace: bool = False, replace_tables: list[str] | None = None):
     """
     Initialize raw tables in DuckDB with primary keys and checksum/timestamp tracking.
 
     Three raw tables feed the dbt models downstream:
-    - raw_members:    one row per target-district House member only
+    - raw_members:    one row per current House or Senate member
     - raw_bills:      one row per member-bill relationship (sponsor or cosponsor)
     - raw_amendments: all amendments to target bills, regardless of sponsor
 
@@ -117,6 +109,22 @@ def create_tables(db, replace: bool = False, replace_tables: list[str] | None = 
         )
     """)
 
+    amendment_state_stmt = (
+        "CREATE OR REPLACE TABLE"
+        if replace and "raw_amendments" in tables_to_replace
+        else "CREATE TABLE IF NOT EXISTS"
+    )
+    db.execute(f"""
+        {amendment_state_stmt} main.bill_amendment_ingestion_state (
+            congress INTEGER,
+            bill_type VARCHAR,
+            bill_number VARCHAR,
+            latest_action_date VARCHAR,
+            processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (congress, bill_type, bill_number)
+        )
+    """)
+
     db.execute(f"""
             -- Track execution lifecycle
          CREATE TABLE IF NOT EXISTS main.ingestion_runs (
@@ -141,25 +149,54 @@ def create_tables(db, replace: bool = False, replace_tables: list[str] | None = 
 
 def get_existing_bill_timestamps(db) -> dict[tuple[int, str, str], str]:
     """
-    Query existing bills and return a map of (congress, bill_type, bill_number) -> latest_action_date.
-    Used for incremental change detection before fetching amendments.
+    Return the last action date processed for amendments per bill.
 
-    Note: we key the delta off `latest_action_date`, not `update_date`. The
-    sponsored/cosponsored *list* endpoint (what the pipeline fetches) does not
-    return a bill `updateDate` at all — only `latestAction.actionDate` — so
-    `update_date` is always NULL here and can never serve as a change signal.
-    `latest_action_date` is stored as a 'YYYY-MM-DD' string, so a lexical MAX is
-    also chronological.
+    This is deliberately separate from raw_bills: bill ingestion may run before
+    the first amendment ingestion, and should not mark amendments as processed.
     """
-    # Ensure table exists first
     create_tables(db, replace=False)
     rows = db.execute("""
-        SELECT congress, bill_type, bill_number, MAX(latest_action_date) as max_update
-        FROM main.raw_bills
+        SELECT congress, bill_type, bill_number, latest_action_date
+        FROM main.bill_amendment_ingestion_state
         WHERE latest_action_date IS NOT NULL
-        GROUP BY congress, bill_type, bill_number
     """).fetchall()
     return {(row[0], row[1].upper(), str(row[2])): row[3] for row in rows}
+
+
+def mark_bill_amendments_processed(db, congress, bill_type, bill_number, latest_action_date):
+    """Persist the bill action date after its amendments were fetched and saved."""
+    db.execute("""
+        INSERT INTO main.bill_amendment_ingestion_state (
+            congress, bill_type, bill_number, latest_action_date, processed_at
+        ) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT (congress, bill_type, bill_number) DO UPDATE SET
+            latest_action_date = EXCLUDED.latest_action_date,
+            processed_at = EXCLUDED.processed_at
+    """, [congress, bill_type.upper(), str(bill_number), latest_action_date])
+
+
+def get_existing_bills(db, chamber: str | None = None) -> list[tuple[int, str, str, str | None]]:
+    """Return distinct stored bills, optionally limited to a chamber."""
+    create_tables(db, replace=False)
+    query = """
+        SELECT bills.congress, bills.bill_type, bills.bill_number,
+               MAX(bills.latest_action_date) AS latest_action_date
+        FROM main.raw_bills AS bills
+    """
+    params = []
+    if chamber and chamber.lower() in ("house", "senate"):
+        query += """
+            JOIN main.raw_members AS members
+              ON bills.member_id = members.bioguide_id
+            WHERE LOWER(members.chamber) = ?
+        """
+        params.append(chamber.lower())
+    query += """
+        GROUP BY bills.congress, bills.bill_type, bills.bill_number
+        ORDER BY bills.congress, bills.bill_type, bills.bill_number
+    """
+    rows = db.execute(query, params).fetchall()
+    return [(row[0], row[1].upper(), str(row[2]), row[3]) for row in rows]
 
 
 def get_existing_members(
@@ -197,78 +234,24 @@ def get_existing_members(
     ]
 
 
-def get_target_districts(db, shuffle: bool = False, use_target_counties: bool = False):
-    """
-    Return the list of congressional districts to ingest members for.
+def get_district_geoids(db) -> dict[tuple[str, int], str]:
+    """Map (state abbreviation, district number) to census congressional GEOID."""
+    if not check_tables_exist(db, ["raw_census__cd11920_county20"]):
+        raise RuntimeError(
+            "Prerequisite seed table 'raw_census__cd11920_county20' is missing. "
+            "Please run 'uv run dbt seed' from the dbt/ directory first."
+        )
 
-    By default (use_target_counties=False) this returns EVERY congressional
-    district present in the census crosswalk (i.e. the full House, and — because
-    the Senate fetch derives its states from this list — every state's senators).
-
-    When use_target_counties=True, the result is restricted to districts that
-    overlap at least one of the counties in the target_counties seed (the
-    previous default scope of ~226 districts across 45 states).
-
-    Each returned tuple is (state_abbr, district_num, geoid_cd, geoid_county).
-    geoid_county is a representative county used only for logging; it is None in
-    all-districts mode (one row per district, no county join).
-
-    Args:
-        db: DuckDB connection
-        shuffle: If True, uses random() ordering (random sampling up to a limit).
-                 If False (default), orders deterministically by GEOID.
-        use_target_counties: If True, restrict to target_counties.csv overlap.
-    """
-    if use_target_counties:
-        if not validate_seed_tables(db):
-            raise RuntimeError(
-                "Prerequisite seed tables ('target_counties', 'raw_census__cd11920_county20') are missing. "
-                "Please run 'uv run dbt seed' from the dbt/ directory first."
-            )
-        order_clause = "random()" if shuffle else "census.GEOID_CD119_20, census.GEOID_COUNTY_20"
-        rows = db.execute(f"""
-            SELECT DISTINCT
-                census.GEOID_CD119_20,
-                census.GEOID_COUNTY_20,
-                LEFT(census.GEOID_CD119_20, 2)                    AS state_fips,
-                CAST(RIGHT(census.GEOID_CD119_20, 2) AS INTEGER)  AS district_num
-            FROM raw_census__cd11920_county20 AS census
-            INNER JOIN target_counties AS tc
-                ON census.GEOID_COUNTY_20 =
-                   LPAD(CAST(tc.state_fips AS VARCHAR), 2, '0')
-                   || LPAD(CAST(tc.county_fips AS VARCHAR), 3, '0')
-            WHERE census.GEOID_CD119_20 NOT LIKE '%ZZ'  -- exclude non-voting delegate districts
-            ORDER BY
-                {order_clause}
-        """).fetchall()
-    else:
-        if not check_tables_exist(db, ["raw_census__cd11920_county20"]):
-            raise RuntimeError(
-                "Prerequisite seed table 'raw_census__cd11920_county20' is missing. "
-                "Please run 'uv run dbt seed' from the dbt/ directory first."
-            )
-        order_clause = "random()" if shuffle else "GEOID_CD119_20"
-        rows = db.execute(f"""
-            SELECT DISTINCT
-                census.GEOID_CD119_20,
-                NULL                                              AS geoid_county,
-                LEFT(census.GEOID_CD119_20, 2)                    AS state_fips,
-                CAST(RIGHT(census.GEOID_CD119_20, 2) AS INTEGER)  AS district_num
-            FROM raw_census__cd11920_county20 AS census
-            WHERE census.GEOID_CD119_20 NOT LIKE '%ZZ'  -- exclude non-voting delegate districts
-            ORDER BY
-                {order_clause}
-        """).fetchall()
-
-    districts = []
-    seen_states = set()
-
-    for geoid_cd, geoid_county, state_fips, district_num in rows:
-        state_abbr = STATE_FIPS_TO_ABBR.get(state_fips)
-        if state_abbr:  # skip territories not in scope (e.g. Puerto Rico, Guam)
-            districts.append((state_abbr, district_num, geoid_cd, geoid_county))
-            seen_states.add(state_abbr)
-
-    scope = "target-county" if use_target_counties else "all"
-    print(f"Found {len(districts)} {scope} districts across {len(seen_states)} states")
-    return districts
+    rows = db.execute("""
+        SELECT DISTINCT
+            GEOID_CD119_20,
+            LEFT(GEOID_CD119_20, 2) AS state_fips,
+            CAST(RIGHT(GEOID_CD119_20, 2) AS INTEGER) AS district_num
+        FROM main.raw_census__cd11920_county20
+        WHERE GEOID_CD119_20 NOT LIKE '%ZZ'
+    """).fetchall()
+    return {
+        (STATE_FIPS_TO_ABBR[state_fips], district_num): geoid_cd
+        for geoid_cd, state_fips, district_num in rows
+        if state_fips in STATE_FIPS_TO_ABBR
+    }

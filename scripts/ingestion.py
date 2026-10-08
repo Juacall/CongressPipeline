@@ -98,9 +98,11 @@ def load_bills(db, bills, member_id, relationship):
     """
     Idempotently upsert bill rows into raw_bills.
     Primary Key: (congress, bill_type, bill_number, member_id, relationship).
+
+    Returns counts for inserted, updated, and unchanged member-bill relationships.
     """
     if not bills:
-        return
+        return {"total": 0, "inserted": 0, "updated": 0, "unchanged": 0}
 
     now_iso = datetime.now(timezone.utc).isoformat()
     rows = []
@@ -128,6 +130,39 @@ def load_bills(db, bills, member_id, relationship):
             update_date, row_hash, now_iso
         ))
 
+    existing_hashes = {}
+    chunk_size = 250
+    for start in range(0, len(rows), chunk_size):
+        chunk = rows[start:start + chunk_size]
+        placeholders = ",".join("(?, ?, ?)" for _ in chunk)
+        params = [member_id, relationship]
+        for row in chunk:
+            params.extend((row[0], row[1], row[2]))
+        existing_hashes.update({
+            (congress, bill_type, bill_number, existing_member_id, existing_relationship): row_hash
+            for congress, bill_type, bill_number, existing_member_id, existing_relationship, row_hash
+            in db.execute(
+                f"""
+                SELECT congress, bill_type, bill_number, member_id, relationship, row_hash
+                FROM main.raw_bills
+                WHERE member_id = ? AND relationship = ?
+                  AND (congress, bill_type, bill_number) IN ({placeholders})
+                """,
+                params,
+            ).fetchall()
+        })
+
+    inserted = updated = unchanged = 0
+    for row in rows:
+        key = (row[0], row[1], row[2], row[6], row[7])
+        existing_hash = existing_hashes.get(key)
+        if existing_hash is None:
+            inserted += 1
+        elif existing_hash != row[9]:
+            updated += 1
+        else:
+            unchanged += 1
+
     db.executemany("""
         INSERT INTO main.raw_bills (
             congress, bill_type, bill_number, title,
@@ -143,6 +178,13 @@ def load_bills(db, bills, member_id, relationship):
             ingested_at = EXCLUDED.ingested_at
         WHERE main.raw_bills.row_hash != EXCLUDED.row_hash
     """, rows)
+
+    return {
+        "total": len(rows),
+        "inserted": inserted,
+        "updated": updated,
+        "unchanged": unchanged,
+    }
 
 
 def load_amendments(db, amendments, congress, bill_type, bill_number):

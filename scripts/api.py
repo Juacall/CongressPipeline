@@ -23,7 +23,6 @@ try:
         HOUSE_BILL_TYPES,
         SENATE_BILL_TYPES,
         MEMBER_LIMIT,
-        STATE_FIPS_TO_ABBR,
     )
 except ImportError:
     from scripts.config import (
@@ -33,21 +32,39 @@ except ImportError:
         HOUSE_BILL_TYPES,
         SENATE_BILL_TYPES,
         MEMBER_LIMIT,
-        STATE_FIPS_TO_ABBR,
     )
 
 
 def api_get(url: str, params: dict | None = None, retries: int = 5) -> dict:
     """
-    Execute an HTTP GET request against the Congress API with throttling and retry on 5xx errors.
+    Execute an HTTP GET request against the Congress API with throttling and
+    retries for rate limits, server errors, and transient network failures.
     """
     query = {"api_key": API_KEY, "format": "json"}
     if params:
         query.update(params)
 
+    last_network_error = None
+    transient_errors = (
+        requests.exceptions.ChunkedEncodingError,
+        requests.exceptions.ConnectionError,
+        requests.exceptions.Timeout,
+    )
     for attempt in range(retries):
         time.sleep(0.1)  # throttle every request
-        response = requests.get(url, params=query)
+        try:
+            response = requests.get(url, params=query)
+        except transient_errors as exc:
+            last_network_error = exc
+            if attempt + 1 == retries:
+                break
+            wait = 2 ** (attempt + 1)
+            print(
+                f"  Network error on attempt {attempt + 1}/{retries}: {exc}. "
+                f"Retrying in {wait}s..."
+            )
+            time.sleep(wait)
+            continue
 
         # 1. Handle Rate Limiting (429)
         if response.status_code == 429:
@@ -65,7 +82,10 @@ def api_get(url: str, params: dict | None = None, retries: int = 5) -> dict:
         response.raise_for_status()
         return response.json()
 
-    raise RuntimeError(f"Failed after {retries} retries: {url}")
+    error = RuntimeError(f"Failed after {retries} retries: {url}")
+    if last_network_error is not None:
+        raise error from last_network_error
+    raise error
 
 
 def paginate(url: str, result_key: str, params: dict | None = None) -> list:
@@ -95,115 +115,61 @@ def paginate(url: str, result_key: str, params: dict | None = None) -> list:
     return results
 
 
-def fetch_members_for_districts(districts: list, member_limit: int | None = MEMBER_LIMIT) -> list:
-    """
-    For each target district, fetch House members from the Congress API scoped
-    to the target Congress.
-
-    Endpoint: /member/congress/{congress}/{stateCode}/{district}
-
-    Deduplicates by bioguideId — a member's district may overlap multiple target
-    counties, but the member should only appear once in raw_members.
-    """
+def fetch_members_for_congress(
+        chamber: str = "house",
+        member_limit: int | None = MEMBER_LIMIT,
+        shuffle: bool = False,
+) -> list:
+    """Fetch current Congress members directly, optionally filtered by chamber."""
+    url = f"{BASE_URL}/member/congress/{CONGRESS}"
+    raw_members = paginate(url, "members")
     members = []
     seen_ids = set()
 
-    for state_abbr, district_num, geoid_cd, geoid_county in districts:
-        if member_limit and len(members) >= member_limit:
-            break
-
-        url = f"{BASE_URL}/member/congress/{CONGRESS}/{state_abbr}/{district_num}"
-        try:
-            page = paginate(url, "members")
-        except requests.HTTPError as e:
-            print(f"  Warning: could not fetch {state_abbr}-{district_num}: {e}")
+    for member in raw_members:
+        bid = member.get("bioguideId")
+        if not bid or bid in seen_ids:
             continue
 
-        for m in page:
-            bid = m.get("bioguideId")
-            if not bid or bid in seen_ids:
-                continue
-            # The Congress API district endpoint is not an exact filter: for some
-            # states it also returns neighboring-district members, and the at-large
-            # endpoint (/{state}/0) returns former House members who are now senators
-            # (district=None). Keep only the member whose own district matches the one
-            # we queried — this both excludes senators and ensures each member is tied
-            # to the correct district (so _geoid_cd for the census join is accurate).
-            if m.get("district") != district_num:
-                continue
-            seen_ids.add(bid)
-            m["chamber"] = "House"
-            m["_geoid_cd"] = geoid_cd  # carry the geoid forward for the census join
-            members.append(m)
-            print(f"  House Member: {m.get('name')} ({state_abbr}-{district_num}) [county GEOID: {geoid_county}]")
-
-    print(f"  Total: {len(members)} House members fetched")
-    return members
-
-
-def fetch_senate_members_for_states(states: list[str], member_limit: int | None = MEMBER_LIMIT) -> list:
-    """
-    For each target state (abbreviation or FIPS code), fetch Senate members from the
-    Congress API scoped to the target Congress using pagination.
-
-    Endpoint: /member/congress/{congress}/{stateCode}
-    """
-    members = []
-    seen_ids = set()
-
-    for state in states:
-        if member_limit and len(members) >= member_limit:
-            break
-
-        state_str = str(state).strip()
-        state_abbr = STATE_FIPS_TO_ABBR.get(
-            state_str.zfill(2) if state_str.isdigit() else state_str.upper(),
-            state_str.upper(),
-        )
-
-        url = f"{BASE_URL}/member/congress/{CONGRESS}/{state_abbr}"
-        try:
-            page = paginate(url, "members")
-        except requests.HTTPError as e:
-            print(f"  Warning: could not fetch Senate members for {state_abbr}: {e}")
-            continue
-
-        for m in page:
-            # Safely parse member terms payload
-            terms = m.get("terms", {})
-            if isinstance(terms, dict):
-                item = terms.get("item", [])
-                term_items = [item] if isinstance(item, dict) else (item if isinstance(item, list) else [])
-            elif isinstance(terms, list):
-                term_items = terms
+        terms = member.get("terms", {})
+        if isinstance(terms, dict):
+            items = terms.get("item", [])
+            if isinstance(items, dict):
+                term_items = [items]
+            elif isinstance(items, list):
+                term_items = items
             else:
                 term_items = []
+        elif isinstance(terms, list):
+            term_items = terms
+        else:
+            term_items = []
 
-            latest_term = term_items[-1] if term_items else {}
-            latest_chamber = latest_term.get("chamber") if isinstance(latest_term, dict) else None
+        latest_term = term_items[-1] if term_items and isinstance(term_items[-1], dict) else {}
+        latest_chamber = latest_term.get("chamber") or member.get("chamber")
+        district = member.get("district")
+        is_senate = latest_chamber == "Senate" or (
+            district is None and latest_chamber != "House of Representatives"
+        )
+        member_chamber = "Senate" if is_senate else "House"
 
-            # Check if member is a Senator (no district assigned or active term chamber is Senate)
-            is_senate = False
-            if latest_chamber == "Senate" or m.get("chamber") == "Senate":
-                is_senate = True
-            elif m.get("district") is None and latest_chamber != "House of Representatives":
-                is_senate = True
+        if chamber.lower() not in ("both", "all", member_chamber.lower()):
+            continue
 
-            if not is_senate:
-                continue
+        member["chamber"] = member_chamber
+        if is_senate:
+            member["district"] = None
+            member["_geoid_cd"] = None
+        seen_ids.add(bid)
+        members.append(member)
 
-            bid = m.get("bioguideId")
-            if not bid or bid in seen_ids:
-                continue
-            seen_ids.add(bid)
-            m["chamber"] = "Senate"
-            m["district"] = None
-            members.append(m)
-            print(f"  Senate Member: {m.get('name')} ({state_abbr})")
-            if member_limit and len(members) >= member_limit:
-                break
+    if shuffle:
+        import random
+        random.shuffle(members)
+    if member_limit is not None:
+        members = members[:member_limit]
 
-    print(f"  Total: {len(members)} Senate members fetched")
+    print(f"  Total: {len(members)} {chamber.title()} members fetched")
     return members
 
 

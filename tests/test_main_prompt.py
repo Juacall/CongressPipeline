@@ -69,39 +69,53 @@ def test_prompt_ingestion_menu_options():
     with patch("builtins.input", side_effect=["1"]):
         res = prompt_ingestion_menu()
         assert res["chamber"] == "house"
-        assert res["members_only"] is True
+        assert res["ingestion_mode"] == "members"
         assert res["skip_members"] is False
 
     # Option 2: Senate Members Only
     with patch("builtins.input", side_effect=["2"]):
         res = prompt_ingestion_menu()
         assert res["chamber"] == "senate"
-        assert res["members_only"] is True
+        assert res["ingestion_mode"] == "members"
         assert res["skip_members"] is False
 
-    # Option 3: House Bills and Amendments
+    # Option 3: House Bills Only
     with patch("builtins.input", side_effect=["3"]):
         res = prompt_ingestion_menu()
         assert res["chamber"] == "house"
-        assert res["members_only"] is False
+        assert res["ingestion_mode"] == "bills"
         assert res["skip_members"] is True
 
-    # Option 4: Senate Bills and Amendments
+    # Option 4: House Amendments Only
     with patch("builtins.input", side_effect=["4"]):
         res = prompt_ingestion_menu()
-        assert res["chamber"] == "senate"
-        assert res["members_only"] is False
+        assert res["chamber"] == "house"
+        assert res["ingestion_mode"] == "amendments"
         assert res["skip_members"] is True
 
-    # Option 5: All (Both Chambers)
+    # Option 5: Senate Bills Only
     with patch("builtins.input", side_effect=["5"]):
         res = prompt_ingestion_menu()
-        assert res["chamber"] == "both"
-        assert res["members_only"] is False
+        assert res["chamber"] == "senate"
+        assert res["ingestion_mode"] == "bills"
         assert res["skip_members"] is True
 
-    # Option 6 / Exit
+    # Option 6: Senate Amendments Only
     with patch("builtins.input", side_effect=["6"]):
+        res = prompt_ingestion_menu()
+        assert res["chamber"] == "senate"
+        assert res["ingestion_mode"] == "amendments"
+        assert res["skip_members"] is True
+
+    # Option 7: All (Both Chambers)
+    with patch("builtins.input", side_effect=["7"]):
+        res = prompt_ingestion_menu()
+        assert res["chamber"] == "both"
+        assert res["ingestion_mode"] == "all"
+        assert res["skip_members"] is False
+
+    # Option 8 / Exit
+    with patch("builtins.input", side_effect=["8"]):
         assert prompt_ingestion_menu() is None
 
     with patch("builtins.input", side_effect=["q"]):
@@ -111,7 +125,7 @@ def test_prompt_ingestion_menu_options():
     with patch("builtins.input", side_effect=["invalid", "99", "1"]):
         res = prompt_ingestion_menu()
         assert res["chamber"] == "house"
-        assert res["members_only"] is True
+        assert res["ingestion_mode"] == "members"
 
 
 if __name__ == "__main__":

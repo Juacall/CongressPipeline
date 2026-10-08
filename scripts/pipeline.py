@@ -5,12 +5,14 @@ import sys
 import time
 import asyncio
 import httpx
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import duckdb
 
 # Bounded queue and concurrency limits to prevent memory bloat and rate-limiting
 QUEUE_MAX_SIZE = 500
 NUM_AMENDMENT_WORKERS = 5
+NUM_BILL_WORKERS = 5
 SEMAPHORE = asyncio.Semaphore(NUM_AMENDMENT_WORKERS)
 
 
@@ -21,8 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from api import (
     fetch_amendments_for_bill,
     fetch_legislation_for_member,
-    fetch_members_for_districts,
-    fetch_senate_members_for_states,
+    fetch_members_for_congress,
 )
 from config import (
     ENV,
@@ -35,10 +36,11 @@ from config import (
 from database import (
     check_tables_exist,
     create_tables,
+    get_district_geoids,
+    get_existing_bills,
     get_existing_bill_timestamps,
     get_existing_members,
-    get_target_districts,
-    validate_seed_tables,
+    mark_bill_amendments_processed,
 )
 from ingestion import load_amendments, load_bills, load_members
 
@@ -80,31 +82,10 @@ def prompt_refresh_mode() -> bool:
         print("Invalid choice. Please enter '1'/'i' for Incremental or '2'/'f' for Full refresh.")
 
 
-def prompt_use_target_counties() -> bool:
-    """
-    Prompt the user for the member scope: every congressional district (full
-    House / all states' senators) or only districts overlapping target_counties.csv.
-    Returns True to restrict to target counties, False for all districts.
-    """
-    print("\nSelect member scope:")
-    print("  1) All districts (full House and every state's senators)")
-    print("  2) Target counties only (restrict to target_counties.csv)")
-
-    while True:
-        choice = input("Scope members to target counties? (1=all, 2=target, or a/t): ").strip().lower()
-        if choice in ("1", "a", "all", "n", "no"):
-            print("Selected: All districts\n")
-            return False
-        elif choice in ("2", "t", "target", "y", "yes"):
-            print("Selected: Target counties only\n")
-            return True
-        print("Invalid choice. Please enter '1'/'a' for All districts or '2'/'t' for Target counties.")
-
-
 def prompt_ingestion_menu() -> dict | None:
     """
     Display interactive menu for selecting the ingestion pipeline task.
-    Returns a dict with 'chamber', 'members_only', and 'skip_members' configuration,
+    Returns a dict with chamber, ingestion mode, and member-source configuration,
     or None if the user chooses to exit.
     """
     print("\n" + "=" * 55)
@@ -113,30 +94,34 @@ def prompt_ingestion_menu() -> dict | None:
     print("Please select which task to run:")
     print("  1) House Members Only")
     print("  2) Senate Members Only")
-    print("  3) House Bills and Amendments")
-    print("  4) Senate Bills and Amendments")
-    print("  5) All (Both Chambers - Members, Bills & Amendments)")
-    print("  6) Exit")
+    print("  3) House Bills Only")
+    print("  4) House Amendments Only")
+    print("  5) Senate Bills Only")
+    print("  6) Senate Amendments Only")
+    print("  7) All (Both Chambers - Members, Bills & Amendments)")
+    print("  8) Exit")
     print("=" * 55)
 
     options = {
-        "1": {"chamber": "house", "members_only": True, "skip_members": False, "label": "House Members Only"},
-        "2": {"chamber": "senate", "members_only": True, "skip_members": False, "label": "Senate Members Only"},
-        "3": {"chamber": "house", "members_only": False, "skip_members": True, "label": "House Bills and Amendments"},
-        "4": {"chamber": "senate", "members_only": False, "skip_members": True, "label": "Senate Bills and Amendments"},
-        "5": {"chamber": "both", "members_only": False, "skip_members": True, "label": "All (Both Chambers - Members, Bills & Amendments)"},
+        "1": {"chamber": "house", "ingestion_mode": "members", "skip_members": False, "label": "House Members Only"},
+        "2": {"chamber": "senate", "ingestion_mode": "members", "skip_members": False, "label": "Senate Members Only"},
+        "3": {"chamber": "house", "ingestion_mode": "bills", "skip_members": True, "label": "House Bills Only"},
+        "4": {"chamber": "house", "ingestion_mode": "amendments", "skip_members": True, "label": "House Amendments Only"},
+        "5": {"chamber": "senate", "ingestion_mode": "bills", "skip_members": True, "label": "Senate Bills Only"},
+        "6": {"chamber": "senate", "ingestion_mode": "amendments", "skip_members": True, "label": "Senate Amendments Only"},
+        "7": {"chamber": "both", "ingestion_mode": "all", "skip_members": False, "label": "All (Both Chambers - Members, Bills & Amendments)"},
     }
 
     while True:
-        choice = input("Enter choice [1-6]: ").strip().lower()
+        choice = input("Enter choice [1-8]: ").strip().lower()
         if choice in options:
             selected = options[choice]
             print(f"Selected: {selected['label']}")
             return selected
-        elif choice in ("6", "q", "quit", "exit"):
+        elif choice in ("8", "q", "quit", "exit"):
             print("Exiting pipeline.")
             return None
-        print("Invalid choice. Please enter a number from 1 to 6 (or 'q' to exit).")
+        print("Invalid choice. Please enter a number from 1 to 8 (or 'q' to exit).")
 
 
 # -- Setup ---------------------------------------------------------------------
@@ -169,9 +154,101 @@ def setup_database(
     else:
         print("Ensuring raw tables exist (incremental/preserve mode)...")
         create_tables(db, replace=False)
+    return should_reset
 
 
 # -- Ingestion -----------------------------------------------------------------
+
+def ingest_members(
+        db,
+        member_limit: int | None = DEFAULT_MEMBER_LIMIT,
+        random_sample: bool = False,
+        chamber: str = DEFAULT_CHAMBER,
+):
+    """Fetch current Congress members and upsert the selected chamber to raw_members."""
+    chamber = (chamber or DEFAULT_CHAMBER).lower()
+    limit_desc = "ALL" if member_limit is None else str(member_limit)
+    print(f"\nFetching {chamber} members from the Congress API (limit={limit_desc}, random={random_sample})...")
+    members = fetch_members_for_congress(
+        chamber=chamber,
+        member_limit=member_limit,
+        shuffle=random_sample,
+    )
+
+    district_geoids = get_district_geoids(db)
+    for member in members:
+        state = (member.get("state") or member.get("stateCode") or "").upper()
+        district = member.get("district")
+        try:
+            district = int(district) if district is not None else None
+        except (TypeError, ValueError):
+            district = None
+        member["district"] = district
+        member["_geoid_cd"] = district_geoids.get((state, district)) if district is not None else None
+
+    member_stats = load_members(db, members)
+    return members, member_stats
+
+
+def ingest_member_bills(db, members, chamber: str = "house"):
+    """Fetch bills concurrently and serialize their DuckDB upserts on this thread."""
+    unique_bills = {}
+    bill_stats = {"total": 0, "inserted": 0, "updated": 0, "unchanged": 0}
+    if not members:
+        print("\n-- Bill Ingestion Complete --")
+        print("  Bills ingested (new or changed): 0")
+        print("  Bills skipped (unchanged): 0")
+        return unique_bills
+
+    def fetch_for_member(member):
+        bid = member["bioguideId"]
+        member_chamber = member.get("chamber") or chamber
+        return fetch_legislation_for_member(bid, chamber=member_chamber)
+
+    with ThreadPoolExecutor(max_workers=NUM_BILL_WORKERS) as executor:
+        futures = {
+            executor.submit(fetch_for_member, member): member
+            for member in members
+        }
+        for idx, future in enumerate(as_completed(futures), start=1):
+            member = futures[future]
+            bid = member["bioguideId"]
+            try:
+                sponsored, cosponsored = future.result()
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to fetch legislation for member {bid} "
+                    f"({member.get('name', bid)})"
+                ) from exc
+
+            member_chamber = member.get("chamber") or chamber
+            print(
+                f"[{idx}/{len(members)}] Loaded legislation for "
+                f"{member.get('name', bid)} ({member_chamber})..."
+            )
+            for bills, relationship in (
+                (sponsored, "sponsor"),
+                (cosponsored, "cosponsor"),
+            ):
+                stats = load_bills(db, bills, bid, relationship)
+                for stat_name in bill_stats:
+                    bill_stats[stat_name] += stats[stat_name]
+
+            for bill in sponsored + cosponsored:
+                key = (bill.get("congress"), bill.get("type", "").upper(), str(bill.get("number")))
+                if key not in unique_bills:
+                    unique_bills[key] = bill
+
+    print("\n-- Bill Ingestion Complete --")
+    print(f"  Member-bill relationships: {bill_stats['total']}")
+    print(
+        "  Bills ingested (new or changed): "
+        f"{bill_stats['inserted'] + bill_stats['updated']} "
+        f"(new: {bill_stats['inserted']}, updated: {bill_stats['updated']})"
+    )
+    print(f"  Bills skipped (unchanged): {bill_stats['unchanged']}")
+    return unique_bills
+
 
 def run_ingestion(
         db,
@@ -180,26 +257,23 @@ def run_ingestion(
         use_async: bool = False,
         members_only: bool = False,
         skip_members: bool = False,
+        ingest_bills: bool = True,
+        ingest_amendments: bool = True,
+        full_refresh: bool = False,
         chamber: str = DEFAULT_CHAMBER,
-        use_target_counties: bool = False,
 ):
     """Fetch data from Congress API and ingest into database tables incrementally."""
     start_time = time.time()
     chamber = (chamber or DEFAULT_CHAMBER).lower()
 
-    # Validate prerequisite tables before running. The census crosswalk is always
-    # required; the target_counties seed is only needed when scoping to it.
-    if use_target_counties:
-        if not validate_seed_tables(db):
+    # Member ingestion uses the census crosswalk only to populate House GEOIDs.
+    amendments_only = ingest_amendments and not ingest_bills
+    if not skip_members and not amendments_only:
+        if not check_tables_exist(db, ["raw_census__cd11920_county20"]):
             raise RuntimeError(
-                "Prerequisite seed tables ('target_counties', 'raw_census__cd11920_county20') are missing. "
+                "Prerequisite seed table 'raw_census__cd11920_county20' is missing. "
                 "Please run 'uv run dbt seed' from the dbt/ directory first."
             )
-    elif not check_tables_exist(db, ["raw_census__cd11920_county20"]):
-        raise RuntimeError(
-            "Prerequisite seed table 'raw_census__cd11920_county20' is missing. "
-            "Please run 'uv run dbt seed' from the dbt/ directory first."
-        )
 
     if not check_tables_exist(db, ["raw_members", "raw_bills", "raw_amendments"]):
         print("Raw destination tables missing. Creating raw tables...")
@@ -208,33 +282,33 @@ def run_ingestion(
     limit_desc = "ALL" if member_limit is None else str(member_limit)
 
     member_stats = None
-    if skip_members:
+    existing_bills = None
+    if members_only:
+        ingest_bills = False
+        ingest_amendments = False
+
+    if amendments_only:
+        members = []
+        print(f"\nLoading stored {chamber} bills from raw_bills for amendment ingestion...")
+        existing_bills = get_existing_bills(
+            db, chamber=chamber if chamber != "both" else None
+        )
+        print(f"Loaded {len(existing_bills)} distinct bill(s) from database.")
+    elif skip_members:
         print(f"\nSkipping member API fetch. Loading existing members from raw_members table (chamber={chamber}, limit={limit_desc}, random={random_sample})...")
         members = get_existing_members(db, member_limit=member_limit, shuffle=random_sample, chamber=chamber if chamber != "both" else None)
         print(f"Loaded {len(members)} member(s) from database.")
     else:
-        scope_desc = "target counties (target_counties.csv)" if use_target_counties else "ALL districts"
-        print(f"\nReading districts from seed tables — scope: {scope_desc} (random={random_sample})...")
-        target_districts = get_target_districts(db, shuffle=random_sample, use_target_counties=use_target_counties)
+        members, member_stats = ingest_members(
+            db,
+            member_limit=member_limit,
+            random_sample=random_sample,
+            chamber=chamber,
+        )
+        existing_bills = None
 
-        members = []
-        if chamber in ("house", "both"):
-            print(f"\nFetching House members from Congress API (limit={limit_desc}, random={random_sample})...")
-            house_members = fetch_members_for_districts(target_districts, member_limit=member_limit)
-            members.extend(house_members)
-
-        if chamber in ("senate", "both"):
-            target_states = list(dict.fromkeys(d[0] for d in target_districts))
-            senate_limit = member_limit if chamber == "senate" else (member_limit - len(members) if member_limit else None)
-            if senate_limit is None or senate_limit > 0:
-                print(f"\nFetching Senate members from Congress API (limit={limit_desc}, random={random_sample})...")
-                senate_members = fetch_senate_members_for_states(target_states, member_limit=senate_limit)
-                members.extend(senate_members)
-
-        member_stats = load_members(db, members)
-
-    if members_only:
-        print("\n'--members-only' flag specified. Skipping bills and amendments ingestion.")
+    if not ingest_bills and not ingest_amendments:
+        print("\nMembers-only mode selected. Skipping bills and amendments ingestion.")
         unique_bills_cnt = 0
         fetched_amdts = 0
         skipped_amdts = 0
@@ -243,16 +317,22 @@ def run_ingestion(
         existing_bill_timestamps = get_existing_bill_timestamps(db)
 
         # Execution Branch: Sync vs Async Engine
-        mode = "Async Streaming" if use_async else "Synchronous"
+        mode = "Async Streaming" if use_async and ingest_amendments else "Synchronous"
         print(f"\n Starting Ingestion Pipeline [{mode} Mode] (chamber={chamber})...")
 
         if use_async:
             unique_bills_cnt, fetched_amdts, skipped_amdts = run_async_pipeline_wrapper(
-                db, members, existing_bill_timestamps, chamber=chamber
+                db, members, existing_bill_timestamps, chamber=chamber,
+                ingest_bills=ingest_bills, ingest_amendments=ingest_amendments,
+                existing_bills=existing_bills,
+                force_amendment_refresh=full_refresh and ingest_amendments,
             )
         else:
             unique_bills_cnt, fetched_amdts, skipped_amdts = run_sync_pipeline(
-                db, members, existing_bill_timestamps, chamber=chamber
+                db, members, existing_bill_timestamps, chamber=chamber,
+                ingest_bills=ingest_bills, ingest_amendments=ingest_amendments,
+                existing_bills=existing_bills,
+                force_amendment_refresh=full_refresh and ingest_amendments,
             )
 
     elapsed = time.time() - start_time
@@ -276,59 +356,127 @@ def run_ingestion(
         print(f"  {table}: {count} rows")
 
 
-def run_sync_pipeline(db, members, existing_timestamps, chamber: str = "house"):
+def run_sync_pipeline(
+        db,
+        members,
+        existing_timestamps,
+        chamber: str = "house",
+        ingest_bills: bool = True,
+        ingest_amendments: bool = True,
+        existing_bills: list[tuple[int, str, str, str | None]] | None = None,
+        force_amendment_refresh: bool = False,
+):
     """Synchronous pipeline using in-memory unique_bills dict."""
     unique_bills = {}
+
+    if ingest_bills:
+        unique_bills = ingest_member_bills(db, members, chamber=chamber)
+
+    if not ingest_amendments:
+        return len(unique_bills), 0, 0
+
+    bills_to_process = existing_bills if existing_bills is not None else unique_bills
+    return ingest_bill_amendments(
+        db,
+        bills_to_process,
+        existing_timestamps=existing_timestamps,
+        full_refresh=force_amendment_refresh,
+    )
+
+
+def _amendment_bill_items(bills):
+    """Normalize bill mappings or stored bill rows to (key, action date) pairs."""
+    if isinstance(bills, dict):
+        for (congress, bill_type, bill_number), bill in bills.items():
+            action_date = (bill.get("latestAction") or {}).get("actionDate")
+            yield (congress, bill_type, bill_number), action_date
+        return
+
+    for congress, bill_type, bill_number, action_date in bills:
+        yield (congress, bill_type, bill_number), action_date
+
+
+def ingest_bill_amendments(
+        db,
+        bills,
+        existing_timestamps: dict | None = None,
+        full_refresh: bool = False,
+        use_async: bool = False,
+):
+    """Fetch and upsert amendments for bills, returning (total, fetched, skipped)."""
+    existing_timestamps = existing_timestamps or {}
+    if use_async:
+        return asyncio.run(_ingest_bill_amendments_async(
+            db, bills, existing_timestamps, full_refresh=full_refresh
+        ))
+
+    items = list(_amendment_bill_items(bills))
+    timestamps = {} if full_refresh else existing_timestamps
     skipped_amendments = 0
     fetched_amendments = 0
-
-    # Stage 1: Load Bills & Deduplicate in Memory
-    for idx, member in enumerate(members, start=1):
-        bid = member["bioguideId"]
-        member_chamber = member.get("chamber") or chamber
-        print(f"[{idx}/{len(members)}] Sync fetching bills for {member.get('name', bid)} ({member_chamber})...")
-        sponsored, cosponsored = fetch_legislation_for_member(bid, chamber=member_chamber)
-
-        load_bills(db, sponsored, bid, "sponsor")
-        load_bills(db, cosponsored, bid, "cosponsor")
-
-        for bill in sponsored + cosponsored:
-            key = (bill.get("congress"), bill.get("type", "").upper(), str(bill.get("number")))
-            if key not in unique_bills:
-                unique_bills[key] = bill
-
-    # Stage 2: Fetch Amendments
-    total_bills = len(unique_bills)
-    for idx, ((congress, bill_type, bill_number), bill) in enumerate(unique_bills.items(), start=1):
+    processed_bills = 0
+    bills_without_amendments = 0
+    for idx, ((congress, bill_type, bill_number), action_date) in enumerate(items, start=1):
         key = (congress, bill_type, bill_number)
         bill_ref = f"{congress}-{bill_type}-{bill_number}"
-        # The list endpoint has no bill updateDate; use latestAction.actionDate as
-        # the change signal (matches raw_bills.latest_action_date in the baseline).
-        # latest_action_date is stored as a VARCHAR, so parse both sides to datetime.
-        current_update = parse_api_date((bill.get("latestAction") or {}).get("actionDate"))
-        previous_update = parse_api_date(existing_timestamps.get(key))
+        current_update = parse_api_date(action_date)
+        previous_update = parse_api_date(timestamps.get(key))
 
         if previous_update and current_update and current_update <= previous_update:
             skipped_amendments += 1
-            print(f"[{idx}/{total_bills}] Skipping amendments for {bill_ref} (unchanged since {previous_update})")
+            print(
+                f"[{idx}/{len(items)}] Skipping bill {bill_ref}: no changes "
+                f"(latest action {current_update}, stored {previous_update})"
+            )
             continue
 
-        fetched_amendments += 1
-        print(f"[{idx}/{total_bills}] Fetching amendments for {bill_ref}...")
+        print(f"[{idx}/{len(items)}] Processing bill {bill_ref}: fetching amendments...")
         amendments = fetch_amendments_for_bill(congress, bill_type, bill_number)
         load_amendments(db, amendments, congress, bill_type, bill_number)
-        print(f"[{idx}/{total_bills}] Loaded {len(amendments)} amendment(s) for {bill_ref}")
+        mark_bill_amendments_processed(
+            db, congress, bill_type, bill_number, action_date
+        )
+        fetched_amendments += 1
+        processed_bills += 1
+        if amendments:
+            print(f"[{idx}/{len(items)}] Processed bill {bill_ref}: loaded {len(amendments)} amendment(s)")
+        else:
+            bills_without_amendments += 1
+            print(f"[{idx}/{len(items)}] Processed bill {bill_ref}: no amendments found")
 
-    return len(unique_bills), fetched_amendments, skipped_amendments
+    print("\n-- Amendment Ingestion Complete --")
+    print(f"  Bills considered: {len(items)}")
+    print(f"  Bills processed: {processed_bills}")
+    print(f"  Bills skipped (no changes): {skipped_amendments}")
+    print(f"  Bills with no amendments: {bills_without_amendments}")
+    return len(items), fetched_amendments, skipped_amendments
 
 
 
 
 # ---------------- Streaming Pipeline Flow ----------------------
 
-def run_async_pipeline_wrapper(db, members, existing_timestamps, chamber: str = "house"):
+def run_async_pipeline_wrapper(
+        db,
+        members,
+        existing_timestamps,
+        chamber: str = "house",
+        ingest_bills: bool = True,
+        ingest_amendments: bool = True,
+        existing_bills: list[tuple[int, str, str, str | None]] | None = None,
+        force_amendment_refresh: bool = False,
+):
     """Wrapper to trigger asyncio event loop for async streaming engine."""
-    return asyncio.run(run_streaming_pipeline(db, members, existing_timestamps, chamber=chamber))
+    if not ingest_amendments:
+        return run_sync_pipeline(
+            db, members, existing_timestamps, chamber=chamber,
+            ingest_bills=ingest_bills, ingest_amendments=False,
+        )
+    return asyncio.run(run_streaming_pipeline(
+        db, members, existing_timestamps, chamber=chamber,
+        ingest_bills=ingest_bills, existing_bills=existing_bills,
+        force_amendment_refresh=force_amendment_refresh,
+    ))
 
 async def amendment_worker(
         worker_id: int,
@@ -360,7 +508,10 @@ async def amendment_worker(
 
         if previous_update and current_update and current_update <= previous_update:
             stats["skipped_amendments"] += 1
-            print(f"[Worker {worker_id}] Skipping amendments for {bill_ref} (unchanged since {previous_update})")
+            print(
+                f"[Worker {worker_id}] Skipping bill {bill_ref}: no changes "
+                f"(latest action {current_update}, stored {previous_update})"
+            )
             queue.task_done()
             continue
 
@@ -373,87 +524,97 @@ async def amendment_worker(
                     fetch_amendments_for_bill, congress, bill_type, bill_number
                 )
 
+                stats["fetched_amendments"] += 1
+                stats["bills_processed"] += 1
                 # 3. Hand off the write to the single-owner db_writer_worker
+                await write_queue.put((
+                    amendments, congress, bill_type, bill_number, update_date_raw
+                ))
                 if amendments:
-                    stats["fetched_amendments"] += 1
-                    await write_queue.put((amendments, congress, bill_type, bill_number))
-                    print(f"[Worker {worker_id}] Fetched {len(amendments)} amendment(s) for {bill_ref} -> queued for write")
+                    print(
+                        f"[Worker {worker_id}] Processed bill {bill_ref}: "
+                        f"fetched {len(amendments)} amendment(s) -> queued for write"
+                    )
                 else:
-                    print(f"[Worker {worker_id}] No amendments for {bill_ref}")
+                    stats["bills_without_amendments"] += 1
+                    print(f"[Worker {worker_id}] Processed bill {bill_ref}: no amendments found")
 
             except Exception as e:
                 print(f"[Worker {worker_id}] Error fetching {bill_ref}: {e}")
             finally:
                 queue.task_done()
 
-async def run_streaming_pipeline(db, members, existing_timestamps, chamber: str = "house"):
-    """
-    Orchestrates streaming bill ingestion and concurrent amendment workers.
-    """
+
+async def _ingest_bill_amendments_async(
+        db,
+        bills,
+        existing_timestamps: dict,
+        full_refresh: bool = False,
+):
+    """Fetch amendments concurrently and serialize DuckDB writes."""
     queue = asyncio.Queue(maxsize=QUEUE_MAX_SIZE)
     write_queue = asyncio.Queue(maxsize=QUEUE_MAX_SIZE)
-    unique_bills_seen = set()
-    stats = {"fetched_amendments": 0, "skipped_amendments": 0}
+    stats = {
+        "bills_processed": 0,
+        "bills_without_amendments": 0,
+        "fetched_amendments": 0,
+        "skipped_amendments": 0,
+    }
+    timestamps = {} if full_refresh else existing_timestamps
 
-    # Single consumer that owns the DuckDB write connection.
     writer = asyncio.create_task(db_writer_worker(db, write_queue))
-
-    # 1. Spawn Worker Pool (Consumers)
     workers = [
-        asyncio.create_task(
-            amendment_worker(i, queue, write_queue, existing_timestamps, stats)
-        )
+        asyncio.create_task(amendment_worker(i, queue, write_queue, timestamps, stats))
         for i in range(NUM_AMENDMENT_WORKERS)
     ]
 
-    # 2. Producer Phase: Fetch legislation for each member
-    for idx, member in enumerate(members, start=1):
-        bid = member["bioguideId"]
-        member_chamber = member.get("chamber") or chamber
-        print(f"[{idx}/{len(members)}] Fetching legislation for {member.get('name', bid)} ({member_chamber})...")
+    items = list(_amendment_bill_items(bills))
+    for (congress, bill_type, bill_number), action_date in items:
+        await queue.put((congress, bill_type, bill_number, action_date))
 
-        # Fetch sponsored / cosponsored (can also be made async)
-        sponsored, cosponsored = fetch_legislation_for_member(bid, chamber=member_chamber)
-
-        # Write member-bill relationships immediately
-        load_bills(db, sponsored, bid, "sponsor")
-        load_bills(db, cosponsored, bid, "cosponsor")
-
-        # Enqueue unique bills for the amendment workers in real time
-        for bill in sponsored + cosponsored:
-            congress = bill.get("congress")
-            bill_type = bill.get("type", "").upper()
-            bill_number = str(bill.get("number"))
-            key = (congress, bill_type, bill_number)
-
-            if key not in unique_bills_seen:
-                unique_bills_seen.add(key)
-                # The list endpoint has no bill updateDate; use latestAction.actionDate
-                # as the change signal (matches raw_bills.latest_action_date baseline).
-                update_date_raw = (bill.get("latestAction") or {}).get("actionDate")
-
-                # Push bill into queue (blocks if queue reaches maxsize)
-                await queue.put((congress, bill_type, bill_number, update_date_raw))
-
-    # 3. Shutdown fetch workers cleanly once all bills are produced
-    await queue.join()  # Wait for all queued bills to be fetched
+    await queue.join()
     for _ in range(NUM_AMENDMENT_WORKERS):
-        await queue.put(None)  # Send sentinel values
+        await queue.put(None)
     await asyncio.gather(*workers)
 
-    # 4. Drain outstanding writes, then stop the writer (order matters: fetch
-    #    workers are done here, so no new items can be enqueued for writing).
     await write_queue.join()
-    await write_queue.put(None)  # Sentinel to stop the writer
+    await write_queue.put(None)
     await writer
 
-    print(f"\n-- Queue Processing Complete --")
-    print(f"  Unique Bills Processed: {len(unique_bills_seen)}")
+    print("\n-- Amendment Ingestion Complete --")
+    print(f"  Bills considered: {len(items)}")
+    print(f"  Bills processed: {stats['bills_processed']}")
+    print(f"  Bills skipped (no changes): {stats['skipped_amendments']}")
+    print(f"  Bills with no amendments: {stats['bills_without_amendments']}")
     print(f"  Amendment Packages Fetched: {stats['fetched_amendments']}")
-    print(f"  Unchanged Bills Skipped: {stats['skipped_amendments']}")
+    return len(items), stats["fetched_amendments"], stats["skipped_amendments"]
 
-    # Match run_sync_pipeline's return shape: (unique_bill_count, fetched, skipped)
-    return len(unique_bills_seen), stats["fetched_amendments"], stats["skipped_amendments"]
+
+async def run_streaming_pipeline(
+        db,
+        members,
+        existing_timestamps,
+        chamber: str = "house",
+        ingest_bills: bool = True,
+        existing_bills: list[tuple[int, str, str, str | None]] | None = None,
+        force_amendment_refresh: bool = False,
+):
+    """
+    Ingest bills, then fetch their amendments concurrently.
+    """
+    if ingest_bills:
+        bills_to_process = ingest_member_bills(db, members, chamber=chamber)
+    elif existing_bills is not None:
+        bills_to_process = existing_bills
+    else:
+        bills_to_process = {}
+
+    return await _ingest_bill_amendments_async(
+        db,
+        bills_to_process,
+        existing_timestamps,
+        full_refresh=force_amendment_refresh,
+    )
 
 async def db_writer_worker(db, write_queue: asyncio.Queue):
     """
@@ -487,7 +648,7 @@ def _flush_batch_to_duckdb(db, batch: list[tuple]):
     """
     Persist a batch of per-bill amendment payloads in a single transaction.
 
-    Each item is (amendments, congress, bill_type, bill_number). Reuses
+    Each item is (amendments, congress, bill_type, bill_number, latest_action_date). Reuses
     load_amendments so the upsert/hash logic lives in exactly one place and
     stays in sync with the raw_amendments schema.
     """
@@ -496,8 +657,11 @@ def _flush_batch_to_duckdb(db, batch: list[tuple]):
 
     db.execute("BEGIN TRANSACTION;")
     try:
-        for amendments, congress, bill_type, bill_number in batch:
+        for amendments, congress, bill_type, bill_number, latest_action_date in batch:
             load_amendments(db, amendments, congress, bill_type, bill_number)
+            mark_bill_amendments_processed(
+                db, congress, bill_type, bill_number, latest_action_date
+            )
         db.execute("COMMIT;")
     except Exception as e:
         db.execute("ROLLBACK;")
@@ -507,15 +671,14 @@ def start_pipeline(args):
     member_limit = None if ENV != 'Dev' else 5
     random_sample = getattr(args, "random", False)
 
-    # Member scope: None = not specified on the CLI (decide below), else explicit.
-    use_target_counties = getattr(args, "target_counties", None)
-
     # Check if explicit mode/chamber CLI flags were passed
     has_explicit_cli_flags = any([
         getattr(args, "house", False),
         getattr(args, "senate", False),
         getattr(args, "chamber", None) is not None,
         getattr(args, "members_only", False),
+        getattr(args, "bills_only", False),
+        getattr(args, "amendments_only", False),
         getattr(args, "skip_members", False),
     ])
 
@@ -527,16 +690,13 @@ def start_pipeline(args):
         if selection is None:
             return  # User selected Exit
         chamber = selection["chamber"]
-        members_only = selection["members_only"]
+        ingestion_mode = selection["ingestion_mode"]
         skip_members = selection["skip_members"]
 
         # Prompt right after the menu for full refresh vs incremental refresh if not specified via CLI
         if reset is None:
             reset = prompt_refresh_mode()
 
-        # Prompt for member scope (all districts vs target counties) if not set via CLI
-        if use_target_counties is None:
-            use_target_counties = prompt_use_target_counties()
     else:
         # Resolve chamber configuration from CLI arguments
         chamber = DEFAULT_CHAMBER
@@ -547,21 +707,31 @@ def start_pipeline(args):
         elif getattr(args, "chamber", None):
             chamber = args.chamber
         members_only = getattr(args, "members_only", False)
+        if getattr(args, "bills_only", False):
+            ingestion_mode = "bills"
+        elif getattr(args, "amendments_only", False):
+            ingestion_mode = "amendments"
+        elif members_only:
+            ingestion_mode = "members"
+        else:
+            ingestion_mode = "all"
         skip_members = getattr(args, "skip_members", False)
 
-    # Default to all districts when scope was not specified via CLI.
-    if use_target_counties is None:
-        use_target_counties = False
+    members_only = ingestion_mode == "members"
+    ingest_bills = ingestion_mode in ("bills", "all")
+    ingest_amendments = ingestion_mode in ("amendments", "all")
 
     db = duckdb.connect(str(DB_PATH))
 
     # Setup phase (table initialization/reset)
     reset_tables = []
-    if not skip_members:
+    if not skip_members and ingestion_mode in ("members", "all"):
         reset_tables.append("raw_members")
-    if not members_only:
-        reset_tables.extend(["raw_bills", "raw_amendments"])
-    setup_database(db, reset=reset, reset_tables=reset_tables)
+    if ingest_bills:
+        reset_tables.append("raw_bills")
+    if ingest_amendments:
+        reset_tables.append("raw_amendments")
+    full_refresh = setup_database(db, reset=reset, reset_tables=reset_tables)
 
     # Ingestion phase
     run_ingestion(
@@ -571,8 +741,10 @@ def start_pipeline(args):
         use_async=getattr(args, "use_async", False),
         members_only=members_only,
         skip_members=skip_members,
+        ingest_bills=ingest_bills,
+        ingest_amendments=ingest_amendments,
+        full_refresh=full_refresh,
         chamber=chamber,
-        use_target_counties=use_target_counties,
     )
 
     db.close()

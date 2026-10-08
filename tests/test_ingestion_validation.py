@@ -2,25 +2,27 @@
 tests/test_ingestion_validation.py
 
 Unit and integration tests for data ingestion, schema validation, checksumming,
-idempotency, deterministic vs. random district sampling, and chamber filtering.
+idempotency, member sampling, and chamber filtering.
 """
 
 from pathlib import Path
 import sys
+from threading import Barrier
 from unittest.mock import patch
+
+import pytest
 
 # Add scripts directory to path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
-import duckdb
-
-from api import fetch_members_for_districts, fetch_senate_members_for_states
 from database import (
     check_tables_exist,
     create_tables,
+    get_district_geoids,
+    get_existing_bills,
+    get_existing_bill_timestamps,
     get_existing_members,
-    get_target_districts,
-    validate_seed_tables,
+    mark_bill_amendments_processed,
 )
 from ingestion import load_amendments, load_bills, load_members
 from main import parse_args
@@ -35,19 +37,35 @@ from mock_data import (
     MOCK_SPONSORED_BILLS,
     create_in_memory_db_with_seeds,
 )
-from pipeline import run_ingestion, setup_database
+from pipeline import (
+    ingest_bill_amendments,
+    ingest_member_bills,
+    ingest_members,
+    run_ingestion,
+    setup_database,
+)
 
 
 def test_table_existence_validation():
     """Verify check_tables_exist accurately detects present and missing tables."""
     db = create_in_memory_db_with_seeds()
 
-    # Raw tables and seed tables must exist in the mock database
+    # Raw tables and census crosswalk seed must exist in the mock database
     assert check_tables_exist(db, ["raw_members", "raw_bills", "raw_amendments"]) is True
-    assert validate_seed_tables(db) is True
+    assert check_tables_exist(db, ["raw_census__cd11920_county20"]) is True
 
     # Non-existent table should return False
     assert check_tables_exist(db, ["non_existent_table"]) is False
+    db.close()
+
+
+def test_get_district_geoids_maps_crosswalk_rows():
+    db = create_in_memory_db_with_seeds()
+
+    geoids = get_district_geoids(db)
+
+    assert geoids[("GA", 14)] == "1314"
+    assert geoids[("TX", 21)] == "4821"
     db.close()
 
 
@@ -65,6 +83,7 @@ def test_full_refresh_replaces_only_selected_raw_tables():
         (congress, bill_type, bill_number, amendment_number, amendment_type)
         VALUES (119, 'HR', '1', '1', 'HAM')
     """)
+    mark_bill_amendments_processed(db, 119, "HR", "1", "2025-01-01")
     db.execute("""
         INSERT INTO main.ingestion_runs (run_id, status)
         VALUES ('existing-run', 'COMPLETED')
@@ -75,9 +94,20 @@ def test_full_refresh_replaces_only_selected_raw_tables():
     assert db.execute("SELECT COUNT(*) FROM main.raw_members").fetchone()[0] == 1
     assert db.execute("SELECT COUNT(*) FROM main.raw_bills").fetchone()[0] == 0
     assert db.execute("SELECT COUNT(*) FROM main.raw_amendments").fetchone()[0] == 1
+    assert get_existing_bill_timestamps(db) == {(119, "HR", "1"): "2025-01-01"}
     assert db.execute(
         "SELECT COUNT(*) FROM main.ingestion_runs WHERE run_id = 'existing-run'"
     ).fetchone()[0] == 1
+    db.close()
+
+
+def test_full_amendment_refresh_clears_processed_bill_state():
+    db = create_in_memory_db_with_seeds()
+    mark_bill_amendments_processed(db, 119, "HR", "1", "2025-01-01")
+
+    setup_database(db, reset=True, reset_tables=["raw_amendments"])
+
+    assert get_existing_bill_timestamps(db) == {}
     db.close()
 
 
@@ -132,51 +162,18 @@ def test_senate_member_ingestion():
     db.close()
 
 
-def test_fetch_senate_members_for_states_pagination_and_filter():
-    """Verify fetch_senate_members_for_states uses paginate and filters for senators."""
-    mock_api_members = [
-        {
-            "bioguideId": "R000614",
-            "name": "Roy, Chip",
-            "state": "TX",
-            "district": 21,
-            "terms": {"item": [{"chamber": "House of Representatives", "startYear": 2019}]},
-        },
-        {
-            "bioguideId": "C001098",
-            "name": "Cruz, Ted",
-            "state": "TX",
-            "district": None,
-            "terms": {"item": [{"chamber": "Senate", "startYear": 2013}]},
-        },
-        {
-            "bioguideId": "C001056",
-            "name": "Cornyn, John",
-            "state": "TX",
-            "district": None,
-            "terms": {"item": {"chamber": "Senate", "startYear": 2002}},  # single dict term test
-        },
-    ]
-
-    with patch("api.paginate", return_value=mock_api_members) as mock_pag:
-        # Test passing state FIPS "48" which maps to "TX"
-        senators = fetch_senate_members_for_states(["48"], member_limit=None)
-        assert len(senators) == 2
-        assert senators[0]["bioguideId"] == "C001098"
-        assert senators[0]["chamber"] == "Senate"
-        assert senators[0]["district"] is None
-        assert senators[1]["bioguideId"] == "C001056"
-        assert senators[1]["chamber"] == "Senate"
-        assert mock_pag.called
-
-
 def test_bills_ingestion_and_relationship():
     """Verify bills are loaded with proper relationship and composite keys."""
     db = create_in_memory_db_with_seeds()
 
     bid = "G000596"
-    load_bills(db, MOCK_SPONSORED_BILLS, bid, "sponsor")
-    load_bills(db, MOCK_COSPONSORED_BILLS, bid, "cosponsor")
+    sponsor_stats = load_bills(db, MOCK_SPONSORED_BILLS, bid, "sponsor")
+    cosponsor_stats = load_bills(db, MOCK_COSPONSORED_BILLS, bid, "cosponsor")
+    unchanged_stats = load_bills(db, MOCK_SPONSORED_BILLS, bid, "sponsor")
+
+    assert sponsor_stats == {"total": 1, "inserted": 1, "updated": 0, "unchanged": 0}
+    assert cosponsor_stats == {"total": 1, "inserted": 1, "updated": 0, "unchanged": 0}
+    assert unchanged_stats == {"total": 1, "inserted": 0, "updated": 0, "unchanged": 1}
 
     rows = db.execute("SELECT congress, bill_type, bill_number, title, member_id, relationship FROM main.raw_bills ORDER BY bill_number").fetchall()
     assert len(rows) == 2
@@ -188,6 +185,25 @@ def test_bills_ingestion_and_relationship():
     # Check cosponsored bill
     b2 = rows[1]
     assert b2 == (119, "HR", "102", "Border Security Acceleration Act", bid, "cosponsor")
+    db.close()
+
+
+@patch("pipeline.fetch_legislation_for_member", return_value=(MOCK_SPONSORED_BILLS, MOCK_COSPONSORED_BILLS))
+def test_house_bill_ingestion_logs_ingested_and_skipped_counts(mock_legislation, capsys):
+    """House bill ingestion logs new rows and skips unchanged rows on rerun."""
+    db = create_in_memory_db_with_seeds()
+    house_member = [MOCK_MEMBERS[0]]
+
+    ingest_member_bills(db, house_member, chamber="house")
+    first_output = capsys.readouterr().out
+    ingest_member_bills(db, house_member, chamber="house")
+    second_output = capsys.readouterr().out
+
+    assert "Bills ingested (new or changed): 2 (new: 2, updated: 0)" in first_output
+    assert "Bills skipped (unchanged): 0" in first_output
+    assert "Bills ingested (new or changed): 0 (new: 0, updated: 0)" in second_output
+    assert "Bills skipped (unchanged): 2" in second_output
+    assert mock_legislation.call_count == 2
     db.close()
 
 
@@ -264,76 +280,6 @@ def test_row_update_on_content_change():
     db.close()
 
 
-def test_deterministic_vs_random_district_sampling():
-    """Verify deterministic vs random ordering options in get_target_districts."""
-    db = create_in_memory_db_with_seeds()
-
-    # Deterministic call
-    districts_det = get_target_districts(db, shuffle=False)
-    assert len(districts_det) == 2
-    # In deterministic mode, GA (1314) comes before TX (4821)
-    assert districts_det[0][0] == "GA"
-    assert districts_det[1][0] == "TX"
-
-    # Random shuffle call returns valid districts in a valid list
-    districts_rand = get_target_districts(db, shuffle=True)
-    assert len(districts_rand) == 2
-    states = {d[0] for d in districts_rand}
-    assert states == {"GA", "TX"}
-
-    db.close()
-
-
-def test_get_target_districts_scope_flag():
-    """Verify use_target_counties toggles between all districts and the target subset."""
-    db = duckdb.connect(":memory:")
-    # Census crosswalk with THREE districts; target_counties covers only ONE of them.
-    db.execute("""
-        CREATE TABLE target_counties (state_fips INTEGER, county_fips INTEGER);
-        INSERT INTO target_counties VALUES (13, 115);  -- GA Floyd -> GEOID 13115
-        CREATE TABLE raw_census__cd11920_county20 (GEOID_CD119_20 VARCHAR, GEOID_COUNTY_20 VARCHAR);
-        INSERT INTO raw_census__cd11920_county20 VALUES
-            ('1314', '13115'),   -- GA-14 (in target counties)
-            ('4821', '48453'),   -- TX-21 (NOT in target counties)
-            ('0611', '06075');   -- CA-11 (NOT in target counties)
-    """)
-
-    all_districts = get_target_districts(db, use_target_counties=False)
-    assert len(all_districts) == 3
-    assert {d[0] for d in all_districts} == {"GA", "TX", "CA"}
-    # all-districts mode carries no county (one row per district)
-    assert all(d[3] is None for d in all_districts)
-
-    target_only = get_target_districts(db, use_target_counties=True)
-    assert len(target_only) == 1
-    assert target_only[0][0] == "GA"
-    assert target_only[0][1] == 14
-    db.close()
-
-
-def test_fetch_members_for_districts_exact_district_match():
-    """Verify the House fetch keeps only members whose district matches the queried one.
-
-    The Congress API district endpoint also returns neighboring-district members and
-    (for at-large /0) former House members now in the Senate (district=None). Only the
-    exact-district member must be kept, with chamber='House' and the queried geoid.
-    """
-    api_page = [
-        {"bioguideId": "P000197", "name": "Pelosi, Nancy", "district": 11},   # exact match
-        {"bioguideId": "D000623", "name": "DeSaulnier, Mark", "district": 10}, # neighbor -> drop
-        {"bioguideId": "L000571", "name": "Lummis, Cynthia", "district": None},# senator -> drop
-    ]
-    with patch("api.paginate", return_value=api_page):
-        members = fetch_members_for_districts([("CA", 11, "0611", None)], member_limit=None)
-
-    assert len(members) == 1
-    m = members[0]
-    assert m["bioguideId"] == "P000197"
-    assert m["chamber"] == "House"
-    assert m["district"] == 11
-    assert m["_geoid_cd"] == "0611"
-
-
 def test_get_existing_members():
     """Verify get_existing_members retrieves member records from raw_members table."""
     db = create_in_memory_db_with_seeds()
@@ -358,13 +304,15 @@ def test_get_existing_members():
 
 
 def test_cli_flags_parsing():
-    """Verify CLI --members-only, --skip-members, --house, --senate, and --random flags are properly parsed."""
+    """Verify CLI task, chamber, member-scope, and sampling flags are parsed."""
     # Test without flags
     with sys_argv(["scripts/main.py", "--limit", "10"]):
         args = parse_args()
         assert args.random is False
         assert args.limit == 10
         assert args.members_only is False
+        assert args.bills_only is False
+        assert args.amendments_only is False
         assert args.skip_members is False
         assert args.house is False
         assert args.senate is False
@@ -373,6 +321,14 @@ def test_cli_flags_parsing():
     with sys_argv(["scripts/main.py", "--members-only"]):
         args = parse_args()
         assert args.members_only is True
+
+    with sys_argv(["scripts/main.py", "--bills-only"]):
+        args = parse_args()
+        assert args.bills_only is True
+
+    with sys_argv(["scripts/main.py", "--amendments-only"]):
+        args = parse_args()
+        assert args.amendments_only is True
 
     # Test with --skip-members
     with sys_argv(["scripts/main.py", "--skip-members"]):
@@ -398,7 +354,139 @@ def test_cli_flags_parsing():
         assert args.house is True
 
 
-@patch("pipeline.fetch_members_for_districts", return_value=MOCK_MEMBERS)
+@patch("pipeline.fetch_members_for_congress", return_value=MOCK_MEMBERS)
+@patch("pipeline.fetch_legislation_for_member", return_value=(MOCK_SPONSORED_BILLS, MOCK_COSPONSORED_BILLS))
+@patch("pipeline.fetch_amendments_for_bill", return_value=MOCK_AMENDMENTS)
+def test_ingest_members_is_callable(mock_amendments, mock_leg, mock_members):
+    """The member stage can be run independently and returns ingestion stats."""
+    db = create_in_memory_db_with_seeds()
+
+    members, stats = ingest_members(db, member_limit=2, chamber="house")
+
+    assert members == MOCK_MEMBERS
+    assert stats == {"total": 2, "inserted": 2, "updated": 0, "unchanged": 0}
+    assert db.execute("SELECT COUNT(*) FROM main.raw_members").fetchone()[0] == 2
+    assert mock_members.called
+    assert not mock_leg.called
+    assert not mock_amendments.called
+    db.close()
+
+
+@patch("pipeline.fetch_legislation_for_member", return_value=(MOCK_SPONSORED_BILLS, MOCK_COSPONSORED_BILLS))
+@patch("pipeline.fetch_amendments_for_bill")
+def test_ingest_member_bills_is_callable(mock_amendments, mock_legislation):
+    """The bill stage can run independently and returns distinct bills."""
+    db = create_in_memory_db_with_seeds()
+
+    bills = ingest_member_bills(db, MOCK_MEMBERS, chamber="house")
+
+    assert list(bills) == [(119, "HR", "101"), (119, "HR", "102")]
+    assert db.execute("SELECT COUNT(*) FROM main.raw_bills").fetchone()[0] == 4
+    assert mock_legislation.call_count == len(MOCK_MEMBERS)
+    assert not mock_amendments.called
+    db.close()
+
+
+def test_ingest_member_bills_fetches_members_concurrently():
+    """Bill API calls run concurrently while their database writes complete safely."""
+    db = create_in_memory_db_with_seeds()
+    members = [
+        {**MOCK_MEMBERS[0], "bioguideId": "TEST01"},
+        {**MOCK_MEMBERS[1], "bioguideId": "TEST02"},
+    ]
+    both_workers_started = Barrier(2)
+
+    def fetch_member_bills(*args, **kwargs):
+        both_workers_started.wait(timeout=5)
+        return MOCK_SPONSORED_BILLS, MOCK_COSPONSORED_BILLS
+
+    with patch("pipeline.fetch_legislation_for_member", side_effect=fetch_member_bills) as mock_fetch:
+        bills = ingest_member_bills(db, members, chamber="house")
+
+    assert len(bills) == 2
+    assert mock_fetch.call_count == 2
+    assert db.execute("SELECT COUNT(*) FROM main.raw_bills").fetchone()[0] == 4
+    db.close()
+
+
+@patch("pipeline.fetch_amendments_for_bill", return_value=MOCK_AMENDMENTS)
+def test_ingest_bill_amendments_is_callable(mock_amendments):
+    """Amendments can be ingested directly from stored bill rows."""
+    db = create_in_memory_db_with_seeds()
+    bills = [
+        (119, "HR", "101", "2025-02-01"),
+        (119, "HR", "102", "2025-02-02"),
+    ]
+
+    result = ingest_bill_amendments(
+        db, bills, full_refresh=True, use_async=True
+    )
+
+    assert result == (2, 2, 0)
+    assert mock_amendments.call_count == 2
+    assert db.execute("SELECT COUNT(*) FROM main.raw_amendments").fetchone()[0] > 0
+    db.close()
+
+
+@pytest.mark.parametrize("use_async", [False, True])
+@patch("pipeline.fetch_amendments_for_bill", return_value=[])
+def test_amendment_ingestion_logs_processed_and_unchanged_bills(
+        mock_amendments, use_async, capsys
+):
+    """Both amendment modes report processed and unchanged bill counts."""
+    db = create_in_memory_db_with_seeds()
+    bills = {
+        (119, "HR", "101"): {"latestAction": {"actionDate": "2025-02-01"}},
+        (119, "HR", "102"): {"latestAction": {"actionDate": "2025-02-02"}},
+    }
+    timestamps = {(119, "HR", "102"): "2025-02-02"}
+
+    result = ingest_bill_amendments(
+        db, bills, existing_timestamps=timestamps, use_async=use_async
+    )
+
+    output = capsys.readouterr().out
+    assert result == (2, 1, 1)
+    assert mock_amendments.call_count == 1
+    assert "Processed bill 119-HR-101: no amendments found" in output
+    assert "Skipping bill 119-HR-102: no changes" in output
+    assert "Bills processed: 1" in output
+    assert "Bills skipped (no changes): 1" in output
+    assert "Bills with no amendments: 1" in output
+    db.close()
+
+
+@pytest.mark.parametrize("use_async", [False, True])
+@patch("pipeline.fetch_amendments_for_bill", return_value=[])
+def test_amendments_process_once_after_bills_are_already_loaded(
+        mock_amendments, use_async
+):
+    """Loading current bill rows does not mark their amendments as processed."""
+    db = create_in_memory_db_with_seeds()
+    load_members(db, MOCK_MEMBERS)
+    load_bills(db, MOCK_SPONSORED_BILLS, "G000596", "sponsor")
+    stored_bills = get_existing_bills(db, chamber="house")
+    assert len(stored_bills) == 1
+
+    # Bills already have the latest action date, but amendment state is still empty.
+    initial_timestamps = get_existing_bill_timestamps(db)
+    assert initial_timestamps == {}
+    assert ingest_bill_amendments(
+        db, stored_bills, existing_timestamps=initial_timestamps, use_async=use_async
+    ) == (1, 1, 0)
+    assert mock_amendments.call_count == 1
+
+    # Once an amendment request succeeds (even when it finds none), later runs skip it.
+    processed_timestamps = get_existing_bill_timestamps(db)
+    assert processed_timestamps == {(119, "HR", "101"): "2025-02-01"}
+    assert ingest_bill_amendments(
+        db, stored_bills, existing_timestamps=processed_timestamps, use_async=use_async
+    ) == (1, 0, 1)
+    assert mock_amendments.call_count == 1
+    db.close()
+
+
+@patch("pipeline.fetch_members_for_congress", return_value=MOCK_MEMBERS)
 @patch("pipeline.fetch_legislation_for_member", return_value=(MOCK_SPONSORED_BILLS, MOCK_COSPONSORED_BILLS))
 @patch("pipeline.fetch_amendments_for_bill", return_value=MOCK_AMENDMENTS)
 def test_run_ingestion_members_only(mock_amendments, mock_leg, mock_members):
@@ -421,7 +509,7 @@ def test_run_ingestion_members_only(mock_amendments, mock_leg, mock_members):
     db.close()
 
 
-@patch("pipeline.fetch_members_for_districts")
+@patch("pipeline.fetch_members_for_congress")
 @patch("pipeline.fetch_legislation_for_member", return_value=(MOCK_SPONSORED_BILLS, MOCK_COSPONSORED_BILLS))
 @patch("pipeline.fetch_amendments_for_bill", return_value=MOCK_AMENDMENTS)
 def test_run_ingestion_skip_members(mock_amendments, mock_leg, mock_members):
@@ -445,7 +533,53 @@ def test_run_ingestion_skip_members(mock_amendments, mock_leg, mock_members):
     db.close()
 
 
-@patch("pipeline.fetch_senate_members_for_states", return_value=MOCK_SENATE_MEMBERS)
+@patch("pipeline.fetch_members_for_congress")
+@patch("pipeline.fetch_legislation_for_member", return_value=(MOCK_SPONSORED_BILLS, MOCK_COSPONSORED_BILLS))
+@patch("pipeline.fetch_amendments_for_bill")
+def test_run_ingestion_bills_only(mock_amendments, mock_leg, mock_members):
+    """Bills-only mode writes bill records without requesting amendments."""
+    db = create_in_memory_db_with_seeds()
+    load_members(db, MOCK_MEMBERS)
+
+    run_ingestion(
+        db, skip_members=True, ingest_bills=True, ingest_amendments=False,
+        chamber="house",
+    )
+
+    assert mock_leg.called
+    assert not mock_amendments.called
+    assert not mock_members.called
+    assert db.execute("SELECT COUNT(*) FROM main.raw_bills").fetchone()[0] > 0
+    assert db.execute("SELECT COUNT(*) FROM main.raw_amendments").fetchone()[0] == 0
+    db.close()
+
+
+@patch("pipeline.fetch_members_for_congress")
+@patch("pipeline.fetch_legislation_for_member")
+@patch("pipeline.fetch_amendments_for_bill", return_value=MOCK_AMENDMENTS)
+def test_run_ingestion_amendments_only(mock_amendments, mock_leg, mock_members):
+    """Amendments-only mode reads stored bills without fetching members or bills."""
+    db = create_in_memory_db_with_seeds()
+    db.execute("DROP TABLE main.raw_census__cd11920_county20")
+    load_members(db, MOCK_MEMBERS)
+    load_bills(db, MOCK_SPONSORED_BILLS, "G000596", "sponsor")
+    load_bills(db, MOCK_COSPONSORED_BILLS, "G000596", "cosponsor")
+    stored_bills = get_existing_bills(db, chamber="house")
+    assert len(stored_bills) == 2
+
+    run_ingestion(
+        db, ingest_bills=False, ingest_amendments=True, full_refresh=True,
+        chamber="house", use_async=True,
+    )
+
+    assert not mock_members.called
+    assert not mock_leg.called
+    assert mock_amendments.call_count == 2
+    assert db.execute("SELECT COUNT(*) FROM main.raw_amendments").fetchone()[0] > 0
+    db.close()
+
+
+@patch("pipeline.fetch_members_for_congress", return_value=MOCK_SENATE_MEMBERS)
 @patch("pipeline.fetch_legislation_for_member", return_value=(MOCK_SENATE_SPONSORED_BILLS, MOCK_SENATE_COSPONSORED_BILLS))
 @patch("pipeline.fetch_amendments_for_bill", return_value=MOCK_SENATE_AMENDMENTS)
 def test_run_ingestion_senate(mock_amendments, mock_leg, mock_senate_members):
@@ -487,12 +621,10 @@ if __name__ == "__main__":
     test_table_existence_validation()
     test_member_ingestion_and_data_validation()
     test_senate_member_ingestion()
-    test_fetch_senate_members_for_states_pagination_and_filter()
     test_bills_ingestion_and_relationship()
     test_amendments_ingestion()
     test_idempotent_duplicate_run()
     test_row_update_on_content_change()
-    test_deterministic_vs_random_district_sampling()
     test_get_existing_members()
     test_cli_flags_parsing()
     test_run_ingestion_members_only()

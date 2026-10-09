@@ -42,4 +42,18 @@ are skipped on later runs; use a full amendment refresh to process them again.
 
 The pipeline should run end-to-end. We'd recommend that you verify that before you begin making changes.
 
-> **Note:** The DuckDB database file (`dev.duckdb`) is gitignored and should not be committed. 
+> **Note:** The DuckDB database file (`dev.duckdb`) is gitignored and should not be committed.
+
+### Build the RAG vector index
+
+The indexer and search agent both use Voyage AI's `voyage-3-lite` embeddings
+(512 dimensions). After building the dbt models, set `VOYAGE_API_KEY` in the
+environment and run `uv run python scripts/rag/indexer.py` from the repository
+root. The indexer hashes chunk content and metadata, embeds only new or changed
+chunks, and removes vectors absent from the current dbt view. Its first run
+rebuilds legacy/incompatible embedding tables; later runs are incremental.
+Running `scripts/rag/agent.py` for searches also requires `ANTHROPIC_API_KEY`
+for its chat model. Override the default Claude model with `ANTHROPIC_MODEL`.
+The SQL tool limits responses to 50 rows and 12,000 characters, truncating long
+cells; for count-and-example questions, the agent is instructed to combine the
+aggregate and a small sample in one query.

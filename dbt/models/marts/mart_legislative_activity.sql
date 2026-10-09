@@ -34,7 +34,9 @@ select
     mdc.member_id                               as target_member_id,
     mdc.member_name                             as target_member_name,
     mdc.chamber                                 as target_member_chamber,
-    mdc.state_code                              as target_member_state,
+    mdc.state_name                              as target_member_state,
+    mdc.state_code                              as target_member_state_code,
+    mdc.state_name                              as target_member_state_name,
     mdc.district_number                         as target_member_district,
     mdc.party_name                              as target_member_party,
 -- How the member relates to the activity

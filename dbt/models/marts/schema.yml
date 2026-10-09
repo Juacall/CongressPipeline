@@ -1,0 +1,21 @@
+version: 2
+
+models:
+  - name: mart_legislative_activity
+    columns:
+      - name: target_member_state
+        description: Backward-compatible alias for the target member's uppercase state name.
+      - name: target_member_state_code
+        description: Two-letter USPS state or territory abbreviation; use for filters such as WA.
+      - name: target_member_state_name
+        description: Uppercase full state or territory name; use for filters such as WASHINGTON.
+      - name: relationship
+        description: Standardized member/activity relationship.
+        data_tests:
+          - accepted_values:
+              arguments:
+                values:
+                  - sponsor
+                  - cosponsor
+                  - amendment_sponsor
+                  - sponsored bill received amendment

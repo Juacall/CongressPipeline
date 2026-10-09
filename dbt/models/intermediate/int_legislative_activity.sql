@@ -30,15 +30,14 @@ with bills as (
         member_id,
         bill_id                             as bill_id,
         bill_title                          as bill_title,
-        null                                as amendment_title,
-        null                                as amendment_id,
-        null                                as amendment_sponsor_id,
+        cast(null as varchar)               as amendment_id,
+        cast(null as varchar)               as amendment_title,
+        cast(null as varchar)               as amendment_sponsor_id,
         'bill'                              as activity_type,
         member_relationship                 as relationship,
         congress,
         bill_type,
         bill_number,
-        -- current status of the (parent) bill
         bill_status                         as bill_status,
         bill_latest_action_date             as bill_latest_action_date,
         bill_latest_action_text             as bill_latest_action_text
@@ -48,10 +47,10 @@ with bills as (
 amendments as (
     select
         b.member_id,
-        a.amendment_id                      as amendment_id,
-        b.bill_title                        as bill_title,
-        a.amendment_title                   as amendment_title,
         b.bill_id                           as bill_id,
+        b.bill_title                        as bill_title,
+        a.amendment_id                      as amendment_id,
+        a.amendment_title                   as amendment_title,
         a.sponsor_id                        as amendment_sponsor_id,
         'amendment'                         as activity_type,
         case
@@ -61,7 +60,6 @@ amendments as (
         a.congress,
         a.bill_type,
         a.bill_number,
-        -- amendments inherit their parent bill's current status
         b.bill_status                       as bill_status,
         b.bill_latest_action_date           as bill_latest_action_date,
         b.bill_latest_action_text           as bill_latest_action_text
@@ -70,10 +68,23 @@ amendments as (
         on  a.congress    = b.congress
         and a.bill_type   = b.bill_type
         and a.bill_number = b.bill_number
+),
+
+unmerged as (
+    select * from bills
+    union all
+    select * from amendments
 )
 
--- being deliberate instead of using *
 select
+    -- Generate primary surrogate key on unmerged result
+    md5(
+            coalesce(cast(member_id as varchar), '') || '-' ||
+            coalesce(cast(relationship as varchar), '') || '-' ||
+            coalesce(cast(activity_type as varchar), '') || '-' ||
+            coalesce(cast(coalesce(amendment_id, bill_id) as varchar), '')
+    ) as legislative_activity_sk,
+
     member_id,
     bill_id,
     bill_title,
@@ -88,23 +99,4 @@ select
     bill_status,
     bill_latest_action_date,
     bill_latest_action_text
-from bills
-
-union all
-
-select
-    member_id,
-    bill_id,
-    bill_title,
-    amendment_id,
-    amendment_title,
-    amendment_sponsor_id,
-    activity_type,
-    relationship,
-    congress,
-    bill_type,
-    bill_number,
-    bill_status,
-    bill_latest_action_date,
-    bill_latest_action_text
-from amendments
+from unmerged

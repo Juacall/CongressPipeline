@@ -1,0 +1,122 @@
+# server.py
+import os
+import duckdb
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional
+
+# Import your existing agent & router modules
+from scripts.rag.agent import agent_executor, DB_PATH
+from scripts.rag.router import PreProcessingRouter
+
+app = FastAPI(title="LegisPulse API", version="1.0.0")
+
+# Enable CORS for Vite dev server (and production domains)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+router = PreProcessingRouter()
+
+CHAMBER_ALIASES = {
+    "h": "house",
+    "house": "house",
+    "house of representatives": "house",
+    "s": "senate",
+    "senate": "senate",
+}
+
+class ChatRequest(BaseModel):
+    query: str
+
+class VoteRequest(BaseModel):
+    politician_id: str
+    vote_type: str  # 'approve', 'disapprove', or 'neutral'
+
+class CommentRequest(BaseModel):
+    politician_id: str
+    text: str
+    vote_type: str
+
+# -------------------------------------------------------------------
+# 1. POLITICIANS & DELEGATION DIRECTORY ENDPOINTS
+# -------------------------------------------------------------------
+
+@app.get("/api/politicians")
+def get_politicians(state: Optional[str] = None, chamber: Optional[str] = None):
+    """Fetch politician directory directly from DuckDB mart_legislative_activity."""
+    conn = duckdb.connect(str(DB_PATH), read_only=True)
+
+    where_clauses = ["1=1"]
+    params = []
+
+    if state and state.upper() != "ALL":
+        where_clauses.append("target_member_state_code = ?")
+        params.append(state.upper())
+
+    normalized_chamber = CHAMBER_ALIASES.get((chamber or "").strip().casefold())
+    if normalized_chamber:
+        where_clauses.append("LOWER(TRIM(target_member_chamber)) = ?")
+        params.append(normalized_chamber)
+
+    where_sql = " AND ".join(where_clauses)
+
+    sql = f"""
+        SELECT 
+            target_member_id AS id,
+            target_member_name AS name,
+            target_member_state_code AS state,
+            target_member_state AS stateName,
+            target_member_chamber AS chamber,
+            target_member_party AS party,
+            COUNT(DISTINCT CASE WHEN relationship = 'sponsor' THEN bill_id END) AS sponsoredCount,
+            COUNT(DISTINCT CASE WHEN relationship = 'cosponsor' THEN bill_id END) AS cosponsoredCount
+        FROM mart_legislative_activity
+        WHERE {where_sql}
+        GROUP BY 1, 2, 3, 4, 5, 6
+        ORDER BY name ASC
+        LIMIT 100;
+    """
+
+    try:
+        df = conn.execute(sql, params).fetchdf()
+        conn.close()
+        return df.to_dict(orient="records")
+    except Exception as e:
+        conn.close()
+        raise HTTPException(status_code=500, detail=f"Database Query Error: {str(e)}")
+
+# -------------------------------------------------------------------
+# 2. RAG AGENT EXECUTION ENDPOINT
+# -------------------------------------------------------------------
+
+@app.post("/api/chat")
+def chat_with_agent(request: ChatRequest):
+    """Runs input through PreProcessingRouter before invoking the LangChain agent."""
+    if not request.query.strip():
+        raise HTTPException(status_code=400, detail="Query string cannot be empty.")
+
+    # Step 1: Pre-process query with Haiku Router
+    analysis = router.process(request.query)
+
+    # Step 2: Execute Agent Executor
+    response = agent_executor.invoke({"messages": [("user", analysis.rewritten_prompt)]})
+    final_answer = response["messages"][-1].content
+
+    return {
+        "routerAnalysis": {
+            "intent": analysis.intent,
+            "detectedState": analysis.state_code or "NATIONAL",
+            "rewrittenPrompt": analysis.rewritten_prompt
+        },
+        "synthesizedAnswer": final_answer
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=True)

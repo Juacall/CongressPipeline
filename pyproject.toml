@@ -1,5 +1,5 @@
 [project]
-name = "mlabs-data-engineering-exercise"
+name = "pulse-backend"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
@@ -8,6 +8,7 @@ dependencies = [
     "dbt-core>=1.11.6",
     "dbt-duckdb>=1.10.1",
     "duckdb",
+    "fastapi>=0.143.0",
     "httpx>=0.28.1",
     "langchain>=1.0.0",
     "langchain-anthropic>=1.7.5",
@@ -17,7 +18,9 @@ dependencies = [
     "langchain-voyageai>=0.1.6",
     "langgraph>=1.0.0",
     "pandas>=2.2.0",
+    "pydantic>=2.12.5",
     "sentence-transformers>=6.1.0",
+    "uvicorn[standard]>=0.54.0",
     "voyageai>=0.5.0",
 ]
 

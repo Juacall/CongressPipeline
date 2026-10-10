@@ -64,4 +64,3 @@ if __name__ == "__main__":
         print(f"Intent:           {result.intent}")
         print(f"State Code:       {result.state_code}")
         print(f"Rewritten Prompt: {result.rewritten_prompt}")
-        ++

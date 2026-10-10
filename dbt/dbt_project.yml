@@ -1,8 +1,8 @@
-name: mlabs_data_engineering_exercise
+name: pulse_backend
 version: "1.0.0"
 config-version: 2
 
-profile: mlabs_data_engineering_exercise
+profile: pulse_backend
 
 model-paths: ["models"]
 seed-paths: ["seeds"]
@@ -14,7 +14,7 @@ clean-targets:
   - "dbt_packages"
 
 seeds:
-  mlabs_data_engineering_exercise:
+  pulse_backend:
     target_counties:
       +column_types:
         county_fips: VARCHAR

@@ -1,4 +1,4 @@
-mlabs_data_engineering_exercise:
+pulse_backend:
   target: dev
   outputs:
     dev:
